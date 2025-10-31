@@ -1,37 +1,30 @@
-// ✅ src/lib/openrouter.ts — simpler version that supports `network.chat({ messages })`
-export function openrouter({ model = "qwen/qwen3-coder:free" } = {}) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error("Missing OPENROUTER_API_KEY in environment");
+import OpenAI from "openai";
+
+export function openrouter({ model }: { model: string }) {
+  const client = new OpenAI({
+    apiKey: process.env.OPENROUTER_API_KEY!,
+    baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
+  });
 
   return {
-    async chat({ messages, temperature = 0.7 }: { messages: { role: string; content: string }[]; temperature?: number }) {
-      console.log("🌐 [OpenRouter] Sending chat completion →", model);
-      console.log("🧠 [OpenRouter] Messages:", JSON.stringify(messages, null, 2));
-
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature,
-        }),
+    // The `request` function that your network will call internally
+    async request(messages: any[]) {
+      const response = await client.chat.completions.create({
+        model,
+        messages,
       });
 
-      if (!res.ok) {
-        const text = await res.text();
-        console.error("❌ [OpenRouter] HTTP Error:", res.status, text);
-        throw new Error(`OpenRouter API error ${res.status}: ${text}`);
-      }
+      return response.choices?.[0]?.message?.content ?? "";
+    },
 
-      const data = await res.json();
-      const content = data?.choices?.[0]?.message?.content ?? "No response";
+    // Optional `run` wrapper for agent-kit compatibility
+    async run(input: any) {
+      const messages = Array.isArray(input)
+        ? input
+        : [{ role: "user", content: String(input) }];
 
-      console.log("✅ [OpenRouter] Response received (length:", content.length, ")");
-      return content;
+      const content = await this.request(messages);
+      return [{ role: "assistant", content }];
     },
   };
 }

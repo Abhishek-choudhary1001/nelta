@@ -15,6 +15,8 @@ import prisma from "@/lib/db";
 import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from "@/prompts";
 import { SANDBOX_TIMEOUT } from "./types";
 
+// =============== 🔧 Utility Functions ===============
+
 function getTextFromMessage(m: any): string {
   if (!m) return "";
   if (typeof m === "string") return m;
@@ -34,9 +36,12 @@ function normalizeToMessages(input: any) {
     });
   }
   if (typeof input === "string") return [{ role: "user", content: input }];
-  if (input && input.messages && Array.isArray(input.messages)) return normalizeToMessages(input.messages);
+  if (input && input.messages && Array.isArray(input.messages))
+    return normalizeToMessages(input.messages);
   return [{ role: "user", content: String(input ?? "") }];
 }
+
+// =============== ⚙️ Inngest Setup ===============
 
 export const inngest = new Inngest({ id: "my-app" });
 
@@ -45,86 +50,99 @@ interface AgentState {
   files: Record<string, string>;
 }
 
+// =============== 🧠 Main Code Agent Function ===============
+
 export const codeAgentFunction = inngest.createFunction(
   { id: "my-app-code-agent" },
   { event: "code-agent/run" },
 
   async ({ event, step }) => {
-    console.log("🚀 [START] codeAgentFunction triggered, event.data:", event.data ?? {});
+    console.log("🚀 [START] codeAgentFunction triggered:", JSON.stringify(event.data ?? {}, null, 2));
+
     try {
       if (!event.data?.projectId) {
+        console.error("❌ [ERROR] Missing projectId in event.data:", event.data);
         throw new Error("Missing projectId in event.data");
       }
 
-      // -- Create Sandbox
+      // Sandbox setup
+      console.log("🧱 [Sandbox] Creating sandbox...");
       const sandboxId = await step.run("create-sandbox", async () => {
         const s = await Sandbox.create("nlhz8vlwyupq845jsdg9");
         await s.setTimeout(SANDBOX_TIMEOUT);
+        console.log("✅ [Sandbox] Created:", s.sandboxId);
         return s.sandboxId;
       });
 
-      // -- Previous Messages
+      // Load chat history
+      console.log("💬 [DB] Fetching previous messages...");
       const previousMessages = await step.run("get-prev-msgs", async () => {
         const msgs = await prisma.message.findMany({
           where: { projectId: event.data.projectId },
           orderBy: { createdAt: "asc" },
           take: 5,
         });
+        console.log("📜 [DB] Retrieved messages:", msgs.length);
         return msgs.map((m) => ({
           role: m.role === "ASSISTANT" ? "assistant" : "user",
           content: m.content ?? "",
         })) as InngestMessage[];
       });
 
+      // Initial state
       const state = createState<AgentState>(
         { summary: "", files: {} },
         { messages: previousMessages as any }
       );
 
-      // -- Model Runner
-      async function modelRunner(input: any, modelName = (process.env.LLM_MODEL ?? "qwen/qwen3-coder:free")) {
+      // =============== 🧩 Model Runner ===============
+      async function modelRunner(input: any, modelName = process.env.LLM_MODEL ?? "qwen/qwen3-coder:free") {
+        console.log("🧠 [ModelRunner] Input:", input);
+        console.log("🧠 [ModelRunner] Model Name:", modelName);
         try {
           const client = openrouter({ model: modelName });
+          console.log("✅ [ModelRunner] OpenRouter Client initialized:", Object.keys(client));
           const messages = normalizeToMessages(input);
-          const responseText = await client.chat({ messages });
-          return [{ role: "assistant", content: responseText }];
+          console.log("🗨️ [ModelRunner] Normalized messages:", messages);
+          const content = await client.request(messages);
+          console.log("💬 [ModelRunner] Model response:", content?.slice?.(0, 200) ?? content);
+          return [{ role: "assistant", content }];
         } catch (err: any) {
+          console.error("❌ [ModelRunner Error]:", err);
           return [{ role: "assistant", content: `Model error: ${String(err?.message ?? err)}` }];
         }
       }
 
-      // -- Agent + Tools
+      // =============== 🧠 Agent Setup ===============
+      console.log("⚙️ [Agent] Creating codeAgent...");
       const codeAgent = createAgent<AgentState>({
         name: "code-agent",
         description: "An expert coding agent",
         system: PROMPT,
         model: {
+          name: "openrouter-qwen",
           run: async (input: any) => modelRunner(input, "qwen/qwen3-coder:free"),
+          request: async (input: any) => modelRunner(input, "qwen/qwen3-coder:free"),
         } as any,
         tools: [
+          // Terminal tool
           createTool({
             name: "terminal",
             description: "Run terminal commands in sandbox",
             parameters: z.object({ command: z.string() }),
             handler: async ({ command }, context) => {
+              console.log("💻 [Tool:Terminal] Command received:", command);
               const { step } = context;
-              if (!step || typeof step.run !== "function") {
-                return "Error: No step context for terminal command";
-              }
+              if (!step?.run) return "No step context";
               return await step.run("terminal", async () => {
-                try {
-                  const sbox = await getSandbox(sandboxId);
-                  const result = await sbox.commands.run(command, {
-                    onStdout: () => {},
-                    onStderr: () => {},
-                  });
-                  return result.stdout;
-                } catch (e) {
-                  return `Command failed: ${String(e)}`;
-                }
+                const sbox = await getSandbox(sandboxId);
+                const result = await sbox.commands.run(command);
+                console.log("📤 [Tool:Terminal] Output:", result.stdout);
+                return result.stdout;
               });
             },
           }),
+          // File writer tool
           createTool({
             name: "createOrUpdateFiles",
             description: "Write files to sandbox",
@@ -132,116 +150,102 @@ export const codeAgentFunction = inngest.createFunction(
               files: z.array(z.object({ path: z.string(), content: z.string() })),
             }),
             handler: async ({ files }, context) => {
-              const { step, network } = context;
-              if (!step || typeof step.run !== "function") {
-                return {};
+              console.log("📂 [Tool:Files] Writing files:", files.map(f => f.path));
+              const { network } = context;
+              const sbox = await getSandbox(sandboxId);
+              const updated: Record<string, string> = {};
+              for (const file of files) {
+                await sbox.files.write(file.path, file.content);
+                updated[file.path] = file.content;
               }
-              const newFiles = await step.run("create-files", async () => {
-                try {
-                  const sbox = await getSandbox(sandboxId);
-                  const updatedFiles = typeof network?.state?.data?.files === "object"
-                    ? { ...network.state.data.files }
-                    : {};
-                  for (const file of files) {
-                    await sbox.files.write(file.path, file.content);
-                    updatedFiles[file.path] = file.content;
-                  }
-                  if (network && typeof network.state === "object" && typeof network.state.data === "object") {
-                    network.state.data.files = updatedFiles;
-                  }
-                  return updatedFiles;
-                } catch (e) {
-                  return {};
-                }
-              });
-              return newFiles;
+              if (network?.state?.data?.files) {
+                network.state.data.files = { ...network.state.data.files, ...updated };
+              }
+              console.log("✅ [Tool:Files] Updated:", Object.keys(updated));
+              return updated;
             },
-          }),
-          createTool({
-            name: "readFiles",
-            description: "Read files from the sandbox",
-            parameters: z.object({ files: z.array(z.string()) }),
-            handler: async ({ files }, context) => {
-              const { step } = context;
-              if (!step || typeof step.run !== "function") {
-                return "Error: No step context for reading files";
-              }
-              return await step.run("readFiles", async () => {
-                try {
-                  const sbox = await getSandbox(sandboxId);
-                  const arr: { path: string; content: string }[] = [];
-                  for (const path of files) {
-                    const content = await sbox.files.read(path);
-                    arr.push({ path, content });
-                  }
-                  return JSON.stringify(arr);
-                } catch (e) {
-                  return `Error: ${String(e)}`;
-                }
-              });
-            }
           }),
         ],
         lifecycle: {
           onResponse: async ({ result, network }) => {
-            const lastText = lastAssistantTextMessageContent(result);
-            if (lastText && network && typeof lastText === "string") {
-              if (lastText.includes("<task_summary>")) network.state.data.summary = lastText;
+            const text = lastAssistantTextMessageContent(result);
+            console.log("💭 [Lifecycle] onResponse triggered, text:", text?.slice(0, 100));
+            if (text?.includes("<task_summary>") && network) {
+              network.state.data.summary = text;
+              console.log("✅ [Lifecycle] Summary updated.");
             }
             return result;
           },
         },
       });
 
+      // =============== 🌐 Network Setup ===============
+      console.log("⚙️ [Network] Creating agent network...");
       const network = createNetwork<AgentState>({
         name: "coding-agent-network",
         agents: [codeAgent],
         maxIter: 15,
         defaultState: state,
         router: async ({ network }) => {
-          const summary = network?.state.data?.summary;
-          if (!summary) return codeAgent;
-          return;
+          console.log("🧭 [Router] Invoked, state:", network?.state?.data);
+          const summary = network?.state?.data?.summary;
+          const agentArray = Array.from(network?.agents?.values?.() ?? []);
+          console.log("🧭 [Router] Found agents:", agentArray.length);
+          const firstAgent = agentArray[0];
+          console.log("🧭 [Router] Returning agent:", summary ? firstAgent?.name : codeAgent.name);
+          return summary ? firstAgent ?? codeAgent : codeAgent;
         },
       });
 
-      // -- Main Run: Only pass { state }
+      console.log("✅ [Network] Created:", Object.keys(network ?? {}));
+      console.log("🔍 [Network] Agent count:", network?.agents?.size ?? 0);
+
+      // Validate agents
+      const agentsList = Array.from(network?.agents?.values?.() ?? []);
+      const firstAgent = agentsList?.[0];
+      console.log("👤 [Debug] First agent:", firstAgent?.name ?? "none");
+
       const userPrompt = event.data?.value ?? "Generate a simple app";
       const runMessages = normalizeToMessages(userPrompt);
+      console.log("💬 [Run] User prompt:", userPrompt);
 
-      console.log("⚙️ [Network.run] Starting agent execution...");
+      // =============== 🚀 Execution ===============
       let result: any;
-      
       try {
-        // 🔍 Deep diagnostics before running
-        console.log("🧠 [Debug] Checking network before run...");
+        console.log("🚦 [Debug] Preparing to execute network...");
         console.log("   typeof network:", typeof network);
-        console.log("   network is defined:", !!network);
-        console.log("   network keys:", Object.keys(network ?? {}));
-        console.log("   network.agents:", Array.isArray((network as any)?.agents) ? (network as any).agents.map((a: any) => a?.name) : "❌ agents not array");
+        console.log("   network keys:", Object.keys(network || {}));
+        console.log("   network.agents:", network?.agents);
+        console.log("   network._agents (raw):", (network as any)?._agents);
+        console.log("   network.defaultModel:", (network as any)?.defaultModel);
         console.log("   typeof network.run:", typeof (network as any)?.run);
       
-        const firstAgent = (network as any)?.agents?.[0];
-        console.log("   firstAgent exists:", !!firstAgent);
-        console.log("   firstAgent.name:", firstAgent?.name);
-        console.log("   model exists:", !!firstAgent?.model);
-        console.log("   typeof firstAgent.model:", typeof firstAgent?.model);
-        console.log("   model keys:", Object.keys(firstAgent?.model ?? {}));
-        console.log("   typeof model.run:", typeof firstAgent?.model?.run);
-        console.log("   typeof model.request:", typeof (firstAgent?.model as any)?.request);
+        // 🧩 Inspect agents in the network
+        const agentsArray = Array.from(((network as any)?._agents?.values?.() ?? []) as Iterable<any>);
+        console.log("   agentsArray length:", agentsArray.length);
       
-        const modelObj = firstAgent?.model;
-        if (!modelObj || typeof modelObj.run !== "function") {
-          console.warn("⚠️ [Debug Warning] model.run missing or not a function — OpenRouter client setup might be invalid.");
+        if (agentsArray.length > 0) {
+          const firstAgent: any = agentsArray[0];
+          console.log("   firstAgent (raw):", firstAgent);
+          console.log("   firstAgent.name:", (firstAgent as any)?.name);
+          console.log("   typeof firstAgent.model:", typeof (firstAgent as any)?.model);
+          console.log("   model keys:", Object.keys(((firstAgent as any)?.model) || {}));
+          console.log("   typeof model.run:", typeof (firstAgent as any)?.model?.run);
+          console.log("   typeof model.request:", typeof (firstAgent as any)?.model?.request);
+        } else {
+          console.warn("⚠️ [Warning] No agents found in network._agents");
         }
       
-        // 🚀 Run the network
-        console.log("🚀 [Network.run] Invoking network.run...");
+        console.log("   runMessages:", runMessages);
+        console.log("   state:", state);
+      
+        // 🚀 Execute network.run
+        console.log("🏁 [Network.run] Executing...");
         result = await (network as any).run(runMessages as any, { state });
-        console.log("✅ [Network.run] Completed successfully");
+        console.log("✅ [Network.run] Completed successfully:", !!result);
       
       } catch (err: any) {
-        console.error("❌ [Network.run] Failed:", err);
+        console.error("💥 [ERROR] network.run failed:", err);
       
         await prisma.message.create({
           data: {
@@ -256,25 +260,23 @@ export const codeAgentFunction = inngest.createFunction(
       }
       
 
-      // -- Generators
+      // =============== 📦 Postprocessing ===============
       const summaryInput = result?.state?.data?.summary ?? "";
+      console.log("📝 [Summary] Generated:", summaryInput?.slice?.(0, 150));
 
       const fragmentTitleGenerator = createAgent({
         name: "fragment-title-generator",
         system: FRAGMENT_TITLE_PROMPT,
-        model: {
-          run: async (input: any) => modelRunner(input, "gpt-4o"),
-        } as any,
+        model: { run: async (input: any) => modelRunner(input, "gpt-4o") } as any,
       });
 
       const responseGenerator = createAgent({
         name: "response-generator",
         system: RESPONSE_PROMPT,
-        model: {
-          run: async (input: any) => modelRunner(input, "gpt-4o"),
-        } as any,
+        model: { run: async (input: any) => modelRunner(input, "gpt-4o") } as any,
       });
 
+      console.log("🧩 [Agents] Generating fragment title and response...");
       const { output: fragOut } = await fragmentTitleGenerator.run(summaryInput);
       const { output: respOut } = await responseGenerator.run(summaryInput);
 
@@ -289,6 +291,8 @@ export const codeAgentFunction = inngest.createFunction(
       const isError =
         !result?.state?.data?.summary ||
         Object.keys(result?.state?.data?.files ?? {}).length === 0;
+
+      console.log("💾 [DB] Saving result, isError:", isError);
 
       await step.run("save-result", async () => {
         if (isError) {
@@ -318,6 +322,7 @@ export const codeAgentFunction = inngest.createFunction(
         });
       });
 
+      console.log("✅ [COMPLETE] Function success");
       return {
         url: sandboxUrl,
         title: fragmentTitle,
@@ -325,6 +330,7 @@ export const codeAgentFunction = inngest.createFunction(
         summary: result.state.data.summary,
       };
     } catch (err: any) {
+      console.error("💥 [FATAL ERROR]", err);
       await prisma.message.create({
         data: {
           projectId: event.data?.projectId ?? "unknown",
