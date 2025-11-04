@@ -8,7 +8,7 @@
 
 # JS SDK
 # import { Sandbox } from 'e2b'
-# const sandbox = await Sandbox.create('my-template-test-3')
+# const sandbox = await ('my-template-test-3')
 
 team_id = "7eef464e-c4de-4ab0-97ae-3f468463d5e4"
 start_cmd = "bash -c '/compile_page.sh'"

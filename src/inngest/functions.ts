@@ -241,7 +241,13 @@ export const codeAgentFunction = inngest.createFunction(
       
         // 🚀 Execute network.run
         console.log("🏁 [Network.run] Executing...");
-        result = await (network as any).run(runMessages as any, { state });
+        const request = new Request(
+          process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000/api/agent",
+          { method: "POST", headers: { "user-agent": "inngest-agent/1.0" } }
+        );
+        
+        // Pass both state and request
+        result = await (network as any).run(runMessages as any, { state, request });
         console.log("✅ [Network.run] Completed successfully:", !!result);
       
       } catch (err: any) {
