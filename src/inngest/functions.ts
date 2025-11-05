@@ -14,6 +14,7 @@ import { z } from "zod";
 import prisma from "@/lib/db";
 import { FRAGMENT_TITLE_PROMPT, PROMPT, RESPONSE_PROMPT } from "@/prompts";
 import { SANDBOX_TIMEOUT } from "./types";
+import { safeModelRun } from "@/lib/safemodelrunner";
 
 // =============== 🔧 Utility Functions ===============
 
@@ -40,6 +41,8 @@ function normalizeToMessages(input: any) {
     return normalizeToMessages(input.messages);
   return [{ role: "user", content: String(input ?? "") }];
 }
+
+
 
 // =============== ⚙️ Inngest Setup ===============
 
@@ -101,15 +104,18 @@ export const codeAgentFunction = inngest.createFunction(
         console.log("🧠 [ModelRunner] Model Name:", modelName);
         try {
           const client = openrouter({ model: modelName });
-          console.log("✅ [ModelRunner] OpenRouter Client initialized:", Object.keys(client));
+          console.log("✅ [ModelRunner] OpenRouter Client initialized:", Object.keys(client || {}));
           const messages = normalizeToMessages(input);
           console.log("🗨️ [ModelRunner] Normalized messages:", messages);
+          // Use client's request and expect a string or structured response
           const content = await client.request(messages);
-          console.log("💬 [ModelRunner] Model response:", content?.slice?.(0, 200) ?? content);
-          return [{ role: "assistant", content }];
+          console.log("💬 [ModelRunner] Model response (truncated):", String(content)?.slice?.(0, 300) ?? content);
+          // Normalize to the { output: [...] } shape
+          const normalized = Array.isArray(content) ? content : [{ role: "assistant", content: String(content) }];
+          return { output: normalized };
         } catch (err: any) {
           console.error("❌ [ModelRunner Error]:", err);
-          return [{ role: "assistant", content: `Model error: ${String(err?.message ?? err)}` }];
+          return { output: [{ role: "assistant", content: `Model error: ${String(err?.message ?? err)}` }] };
         }
       }
 
@@ -121,11 +127,11 @@ export const codeAgentFunction = inngest.createFunction(
         system: PROMPT,
         model: {
           name: "openrouter-qwen",
+          // We provide both run and request wrappers (they use the same underlying modelRunner)
           run: async (input: any) => modelRunner(input, "qwen/qwen3-coder:free"),
           request: async (input: any) => modelRunner(input, "qwen/qwen3-coder:free"),
         } as any,
         tools: [
-          // Terminal tool
           createTool({
             name: "terminal",
             description: "Run terminal commands in sandbox",
@@ -142,7 +148,6 @@ export const codeAgentFunction = inngest.createFunction(
               });
             },
           }),
-          // File writer tool
           createTool({
             name: "createOrUpdateFiles",
             description: "Write files to sandbox",
@@ -219,11 +224,11 @@ export const codeAgentFunction = inngest.createFunction(
         console.log("   network._agents (raw):", (network as any)?._agents);
         console.log("   network.defaultModel:", (network as any)?.defaultModel);
         console.log("   typeof network.run:", typeof (network as any)?.run);
-      
+
         // 🧩 Inspect agents in the network
         const agentsArray = Array.from(((network as any)?._agents?.values?.() ?? []) as Iterable<any>);
         console.log("   agentsArray length:", agentsArray.length);
-      
+
         if (agentsArray.length > 0) {
           const firstAgent: any = agentsArray[0];
           console.log("   firstAgent (raw):", firstAgent);
@@ -235,24 +240,20 @@ export const codeAgentFunction = inngest.createFunction(
         } else {
           console.warn("⚠️ [Warning] No agents found in network._agents");
         }
-      
+
         console.log("   runMessages:", runMessages);
         console.log("   state:", state);
-      
-        // 🚀 Execute network.run
-        console.log("🏁 [Network.run] Executing...");
-        const request = new Request(
-          process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000/api/agent",
-          { method: "POST", headers: { "user-agent": "inngest-agent/1.0" } }
-        );
-        
-        // Pass both state and request
-        result = await (network as any).run(runMessages as any, { state, request });
+
+        // 🚀 Execute network.run wrapped in step.run for proper context
+        console.log("🏁 [Network.run] Executing network...");
+        result = await step.run("execute-network", async () => {
+          return await network.run(runMessages, { state, step, event });
+        });
+
         console.log("✅ [Network.run] Completed successfully:", !!result);
-      
       } catch (err: any) {
         console.error("💥 [ERROR] network.run failed:", err);
-      
+
         await prisma.message.create({
           data: {
             projectId: event.data?.projectId ?? "unknown",
@@ -261,10 +262,9 @@ export const codeAgentFunction = inngest.createFunction(
             type: "ERROR",
           },
         });
-      
+
         throw err;
       }
-      
 
       // =============== 📦 Postprocessing ===============
       const summaryInput = result?.state?.data?.summary ?? "";
@@ -273,18 +273,36 @@ export const codeAgentFunction = inngest.createFunction(
       const fragmentTitleGenerator = createAgent({
         name: "fragment-title-generator",
         system: FRAGMENT_TITLE_PROMPT,
-        model: { run: async (input: any) => modelRunner(input, "gpt-4o") } as any,
+        model: {
+          // expose run that returns normalized { output: [...] }
+          run: async (input: any, ctx?: any) => {
+            return await modelRunner(input, "qwen/qwen3-coder:free");
+          },
+          request: async (input: any, ctx?: any) => {
+            return await modelRunner(input, "qwen/qwen3-coder:free");
+          },
+        } as any,
       });
-
+      
       const responseGenerator = createAgent({
         name: "response-generator",
         system: RESPONSE_PROMPT,
-        model: { run: async (input: any) => modelRunner(input, "gpt-4o") } as any,
+        model: {
+          run: async (input: any, ctx?: any) => {
+            return await modelRunner(input, "qwen/qwen3-coder:free");
+          },
+          request: async (input: any, ctx?: any) => {
+            return await modelRunner(input, "qwen/qwen3-coder:free");
+          },
+        } as any,
       });
 
       console.log("🧩 [Agents] Generating fragment title and response...");
-      const { output: fragOut } = await fragmentTitleGenerator.run(summaryInput);
-      const { output: respOut } = await responseGenerator.run(summaryInput);
+      // Define a minimal context for safeModelRun
+      const ctx = { state: result?.state ?? {}, event };
+
+      const { output: fragOut } = await safeModelRun(fragmentTitleGenerator, summaryInput, ctx);
+      const { output: respOut } = await safeModelRun(responseGenerator, summaryInput, ctx);
 
       const fragmentTitle = getTextFromMessage(fragOut?.[0]) || "Fragment";
       const responseText = getTextFromMessage(respOut?.[0]) || "Here you go";
@@ -329,12 +347,16 @@ export const codeAgentFunction = inngest.createFunction(
       });
 
       console.log("✅ [COMPLETE] Function success");
-      return {
+      const safeState = result?.state?.data ?? { files: {}, summary: "" };
+
+      const payload = {
         url: sandboxUrl,
         title: fragmentTitle,
-        files: result.state.data.files,
-        summary: result.state.data.summary,
+        files: safeState.files,
+        summary: safeState.summary,
       };
+      
+      return payload;
     } catch (err: any) {
       console.error("💥 [FATAL ERROR]", err);
       await prisma.message.create({
