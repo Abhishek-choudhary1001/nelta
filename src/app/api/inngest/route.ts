@@ -1,6 +1,6 @@
 import { serve } from "inngest/next";
 import { inngest } from "../../../inngest/client";
-import { codeAgentFunction } from "@/inngest/functions";
+import { codeAgentFunction } from "@/inngest/langchain-function";
 
 // Create an API that serves zero functions
 export const { GET, POST, PUT } = serve({
