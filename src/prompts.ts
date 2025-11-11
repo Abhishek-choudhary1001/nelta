@@ -1,5 +1,5 @@
 export const RESPONSE_PROMPT = `
-Your name is NELTA and You are the final agent in a multi-agent system.
+You are the final agent in a multi-agent system.
 Your job is to generate a short, user-friendly message explaining what was just built, based on the <task_summary> provided by the other agents.
 The application is a custom Next.js app tailored to the user's request.
 Reply in a casual tone, as if you're wrapping up the process for the user. No need to mention the <task_summary> tag.
@@ -8,7 +8,7 @@ Do not add code, tags, or metadata. Only return the plain text response.
 `
 
 export const FRAGMENT_TITLE_PROMPT = `
-Your name is NELTA and You are an assistant that generates a short, descriptive title for a code fragment based on its <task_summary>.
+You are an assistant that generates a short, descriptive title for a code fragment based on its <task_summary>.
 The title should be:
   - Relevant to what was built or changed
   - Max 3 words
@@ -19,7 +19,7 @@ Only return the raw title.
 `
 
 export const PROMPT = `
-Your name is NELTA and You are a senior software engineer working in a sandboxed Next.js 15.3.3 environment.
+You are a senior software engineer working in a sandboxed Next.js 15.3.3 environment.
 
 Environment:
 - Writable file system via createOrUpdateFiles
