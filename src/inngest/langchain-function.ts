@@ -1,20 +1,23 @@
+import { inngest } from "./client";
 import { Inngest } from "inngest";
 import { ChatOpenAI } from "@langchain/openai";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import prisma from "@/lib/db";
-import { PROMPT } from "@/prompts";
+import { PROMPT, FRAGMENT_TITLE_PROMPT, RESPONSE_PROMPT } from "@/prompts";
 import { Sandbox } from "@e2b/code-interpreter";
 
-// ✅ Create inngest client
-export const inngest = new Inngest({ id: "my-app" });
+// NOTE: This file replaces the @inngest/agent-kit network/agent logic with
+// a LangChain-based agent implementation while preserving the original
+// sandboxing, file I/O and DB persistence behaviour.
 
-// ✅ Define event function
+// Create the Inngest function
 export const codeAgentFunction = inngest.createFunction(
-  { id: "langchain-code-agent", retries: 0 },
+  { id: "code-agent", retries: 0 },
   { event: "code-agent/run" },
   async ({ event, step }) => {
-    // ✅ Type-safe sandbox fallback
+    // Lightweight sandbox fallback to keep TS happy during static analysis
+    // @ts-ignore - fallback mock object is not a full Sandbox
     const sandboxFallback: Sandbox = {
       commands: {} as any,
       process: {} as any,
@@ -25,27 +28,31 @@ export const codeAgentFunction = inngest.createFunction(
     let sandbox: Sandbox = sandboxFallback;
 
     try {
-      // 🏗️ Create sandbox
-      // @ts-expect-error: sandbox fallback is a loose mock, real Sandbox is created later
-      sandbox = await step.run("create-sandbox", async () => {
+      // Create or allocate a remote sandbox
+      const sandboxIdOrInstance = await step.run("create-sandbox", async () => {
         console.log("[Sandbox] Creating...");
         const sbx = await Sandbox.create("k0wmnzir0zuzye6dndlw", {
-          timeoutMs: 600000,
+          timeoutMs: 600_000,
           metadata: { projectId: event.data.projectId },
         });
-        console.log(`[Sandbox] Created: ${sbx.getHost()}`);
+        console.log(`[Sandbox] Created: ${sbx.getHost?.()}`);
         return sbx;
       });
 
-      // 🧠 Initialize model
+      // If step returned the instance, use it, otherwise if it returned id, fetch it
+      sandbox = (sandboxIdOrInstance as any)?.sandboxId
+        ? await Sandbox.create(sandboxIdOrInstance.sandboxId)
+        : (sandboxIdOrInstance as Sandbox);
+
+      // Initialize LangChain model (use OpenRouter's Qwen or fallback)
       const model = new ChatOpenAI({
         modelName: process.env.LLM_MODEL ?? "qwen/qwen3-coder:free",
         openAIApiKey: process.env.OPENROUTER_API_KEY,
         configuration: { baseURL: "https://openrouter.ai/api/v1" },
-        temperature: 0.7,
+        temperature: 0.2,
       });
 
-      // 🧰 Tool: Terminal
+      // Terminal tool
       const terminalTool = new DynamicStructuredTool({
         name: "terminal",
         description: "Run terminal commands inside sandbox",
@@ -59,8 +66,7 @@ export const codeAgentFunction = inngest.createFunction(
             });
 
             const output =
-              (proc.output as any)?.stdout ??
-              (proc.output as any)?.stderr ??
+              (proc.output as any)?.stdout ?? (proc.output as any)?.stderr ??
               "Command executed successfully";
             return output;
           } catch (error: unknown) {
@@ -70,33 +76,28 @@ export const codeAgentFunction = inngest.createFunction(
         },
       });
 
-      // 🧰 Tool: File Writer
+      // File writer tool
       const fileWriteTool = new DynamicStructuredTool({
         name: "createOrUpdateFiles",
         description: "Write or update files in sandbox",
-        schema: z.object({
-          files: z.array(z.object({ path: z.string(), content: z.string() })),
-        }),
+        schema: z.object({ files: z.array(z.object({ path: z.string(), content: z.string() })) }),
         func: async ({ files }) => {
           console.log(`[Tool] Writing ${files.length} file(s)`);
           try {
             for (const file of files) {
-              const fullPath = file.path.startsWith("/home/user/")
-                ? file.path
-                : `/home/user/${file.path}`;
+              const fullPath = file.path.startsWith("/home/user/") ? file.path : `/home/user/${file.path}`;
               await sandbox.fs.write(fullPath, file.content);
               console.log(`[Tool] Wrote: ${fullPath}`);
             }
             return `✅ Wrote ${files.length} files`;
           } catch (error: unknown) {
-            if (error instanceof Error)
-              return `Error writing files: ${error.message}`;
+            if (error instanceof Error) return `Error writing files: ${error.message}`;
             return "Unknown error writing files";
           }
         },
       });
 
-      // 🧰 Tool: File Reader
+      // File reader tool
       const readFilesTool = new DynamicStructuredTool({
         name: "readFiles",
         description: "Read files from sandbox",
@@ -105,144 +106,111 @@ export const codeAgentFunction = inngest.createFunction(
           const results: Record<string, string> = {};
           try {
             for (const path of paths) {
-              const fullPath = path.startsWith("/home/user/")
-                ? path
-                : `/home/user/${path}`;
+              const fullPath = path.startsWith("/home/user/") ? path : `/home/user/${path}`;
               const content = await sandbox.fs.read(fullPath);
               results[path] = content;
             }
             return JSON.stringify(results, null, 2);
           } catch (error: unknown) {
-            if (error instanceof Error)
-              return `Error reading files: ${error.message}`;
+            if (error instanceof Error) return `Error reading files: ${error.message}`;
             return "Unknown error reading files";
           }
         },
       });
 
-      // 🧩 Bind tools
-      const modelWithTools = model.bindTools([
-        terminalTool,
-        fileWriteTool,
-        readFilesTool,
-      ]);
+      // Bind tools to model
+      const modelWithTools = model.bindTools([terminalTool, fileWriteTool, readFilesTool]);
 
-      // 💬 Load messages
+      // Load previous messages from DB
       const previousMessages = await step.run("load-msgs", async () => {
         const msgs = await prisma.message.findMany({
           where: { projectId: event.data.projectId },
           orderBy: { createdAt: "asc" },
           take: 10,
         });
-        return msgs.map((m) => ({
-          role: m.role === "ASSISTANT" ? "assistant" : "user",
-          content: m.content ?? "",
-        }));
+        return msgs.map((m) => ({ role: m.role === "ASSISTANT" ? "assistant" : "user", content: m.content ?? "" }));
       });
 
+      // Prepare conversation
       const messages: any[] = [
         { role: "system", content: PROMPT },
         ...previousMessages,
         { role: "user", content: event.data.value },
       ];
 
-      // 🔁 Tool Loop
+      // Tool-use loop
       let iterations = 0;
       const maxIterations = 20;
       let response: any;
 
       while (iterations < maxIterations) {
         response = await modelWithTools.invoke(messages);
-        
-        // Add the assistant's response to messages (including tool calls)
-        messages.push(response);
 
-        // If no tool calls, break the loop
+        // capture assistant content
+        if (response.content) {
+          const text = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+          messages.push({ role: "assistant", content: text });
+        }
+
         if (!response.tool_calls?.length) break;
 
         const toolResults: any[] = [];
-
-        // Execute tool calls
         for (const toolCall of response.tool_calls) {
-          let result: string;
-          
+          let toolResult = "";
           switch (toolCall.name) {
-            case "terminal": {
-              result = await terminalTool.func(
-                toolCall.args as { command: string }
-              );
+            case "terminal":
+              toolResult = await terminalTool.func(toolCall.args as { command: string });
               break;
-            }
-            case "createOrUpdateFiles": {
-              result = await fileWriteTool.func(
-                toolCall.args as {
-                  files: { path: string; content: string }[];
-                }
-              );
+            case "createOrUpdateFiles":
+              toolResult = await fileWriteTool.func(toolCall.args as { files: { path: string; content: string }[] });
               break;
-            }
-            case "readFiles": {
-              result = await readFilesTool.func(
-                toolCall.args as { paths: string[] }
-              );
+            case "readFiles":
+              toolResult = await readFilesTool.func(toolCall.args as { paths: string[] });
               break;
-            }
             default:
-              result = "Unknown tool";
+              toolResult = "Unknown tool";
           }
-
-          toolResults.push({
-            role: "tool",
-            content: result,
-            tool_call_id: toolCall.id,
-          });
+          toolResults.push({ role: "tool", content: toolResult, tool_call_id: toolCall.id });
         }
 
-        // Add tool results to messages
         messages.push(...toolResults);
         iterations++;
       }
 
-      // 🎯 Get final response after tool loop completes
+      // Build final response text
       let finalResponse = "";
       if (response?.content) {
         if (typeof response.content === "string") {
           finalResponse = response.content;
         } else if (Array.isArray(response.content)) {
-          // Handle content blocks
           finalResponse = response.content
-            .filter((block: any) => block.type === "text")
-            .map((block: any) => block.text)
+            .filter((b: any) => b.type === "text")
+            .map((b: any) => b.text ?? (typeof b.content === "string" ? b.content : JSON.stringify(b.content)))
             .join("\n");
         } else {
           finalResponse = JSON.stringify(response.content);
         }
       }
 
-      // If no content in final response, ask model to summarize
+      // If assistant was silent, ask for a summary
       if (!finalResponse || finalResponse.trim().length === 0) {
-        messages.push({
-          role: "user",
-          content: "Please provide a summary of what you've built and any important details.",
-        });
-        const summaryResponse = await model.invoke(messages);
-        finalResponse = typeof summaryResponse.content === "string" 
-          ? summaryResponse.content 
-          : JSON.stringify(summaryResponse.content);
+        messages.push({ role: "user", content: "Please provide a summary of what you've built and any important details." });
+        const summaryResp = await model.invoke(messages);
+        finalResponse = typeof summaryResp.content === "string" ? summaryResp.content : JSON.stringify(summaryResp.content);
       }
 
-      // 📁 Read Generated Files BEFORE starting server
+      // Read generated files
       const generatedFiles = await step.run("get-files", async () => {
         const files: Record<string, string> = {};
         try {
-          const filesToRead = [
+          const filesToRead: string[] = [
             "app/page.tsx",
             "app/layout.tsx",
             "tailwind.config.ts",
             "package.json",
           ];
-          
-          // Try to list files in app directory
+
+          // Try reading /home/user/app
           try {
             const appFiles = await sandbox.fs.list("/home/user/app");
             for (const file of appFiles) {
@@ -255,7 +223,7 @@ export const codeAgentFunction = inngest.createFunction(
             console.log("[Files] Could not list app directory");
           }
 
-          // Also check for standalone HTML files (for simple demos)
+          // Also look for root HTML files
           try {
             const rootFiles = await sandbox.fs.list("/home/user");
             for (const file of rootFiles) {
@@ -268,17 +236,14 @@ export const codeAgentFunction = inngest.createFunction(
             console.log("[Files] Could not list root directory");
           }
 
-          // Read all files
           for (const path of filesToRead) {
             try {
-              const fullPath = path.startsWith("/home/user/")
-                ? path
-                : `/home/user/${path}`;
+              const fullPath = path.startsWith("/home/user/") ? path : `/home/user/${path}`;
               const content = await sandbox.fs.read(fullPath);
               files[path] = content;
               console.log(`[Files] Read: ${path}`);
             } catch {
-              // ignore missing files
+              // ignore
             }
           }
         } catch (err: unknown) {
@@ -287,13 +252,12 @@ export const codeAgentFunction = inngest.createFunction(
         return files;
       });
 
-      // 🚀 Start Next.js Dev Server (or detect simple HTML)
+      // Decide how to preview: Next.js, simple HTML, or just sandbox root
       let sandboxUrl = "";
-      const hasHtmlFiles = Object.keys(generatedFiles).some(f => f.endsWith('.html'));
-      const hasNextjsApp = generatedFiles["app/page.tsx"] || generatedFiles["package.json"];
+      const hasHtmlFiles = Object.keys(generatedFiles).some((f) => f.endsWith(".html"));
+      const hasNextjsApp = Boolean(generatedFiles["app/page.tsx"] && generatedFiles["package.json"]);
 
       if (hasNextjsApp) {
-        // Start Next.js server
         await step.run("start-server", async () => {
           console.log("[Sandbox] Starting Next.js dev server...");
           sandbox.process?.start?.({
@@ -306,27 +270,19 @@ export const codeAgentFunction = inngest.createFunction(
           const maxAttempts = 30;
           while (attempts < maxAttempts) {
             try {
-              const res = await fetch(`https://${sandbox.getHost()}/`, {
-                method: "HEAD",
-              });
-              if (res.ok) {
-                console.log("[Server] Next.js dev server is ready!");
-                break;
-              }
+              const res = await fetch(`https://${sandbox.getHost()}/`, { method: "HEAD" });
+              if (res.ok) break;
             } catch {
               // retry
             }
             await new Promise((r) => setTimeout(r, 2000));
             attempts++;
           }
-          
-          if (attempts >= maxAttempts) {
-            console.warn("[Server] Server might not be ready yet");
-          }
+
+          if (attempts >= maxAttempts) console.warn("[Server] Server might not be ready yet");
         });
         sandboxUrl = `https://${sandbox.getHost()}`;
       } else if (hasHtmlFiles) {
-        // For simple HTML files, use Python HTTP server
         await step.run("start-html-server", async () => {
           console.log("[Sandbox] Starting HTTP server for HTML files...");
           sandbox.process?.start?.({
@@ -335,23 +291,18 @@ export const codeAgentFunction = inngest.createFunction(
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
 
-          await new Promise((r) => setTimeout(r, 3000)); // Wait for server to start
+          await new Promise((r) => setTimeout(r, 3000));
         });
-        
-        // Find the main HTML file
-        const mainHtmlFile = Object.keys(generatedFiles).find(f => 
-          f === 'index.html' || f.endsWith('index.html')
-        ) || Object.keys(generatedFiles).find(f => f.endsWith('.html'));
-        
-        const htmlPath = mainHtmlFile ? `/${mainHtmlFile.replace('/home/user/', '')}` : '';
+
+        const mainHtmlFile = Object.keys(generatedFiles).find((f) => f === "index.html" || f.endsWith("index.html")) || Object.keys(generatedFiles).find((f) => f.endsWith(".html"));
+        const htmlPath = mainHtmlFile ? `/${mainHtmlFile.replace('/home/user/', '')}` : "";
         sandboxUrl = `https://${sandbox.getHost()}${htmlPath}`;
       } else {
-        // No recognizable app structure
         sandboxUrl = `https://${sandbox.getHost()}`;
         console.warn("[Server] No Next.js or HTML files detected");
       }
 
-      // 💾 Save to DB with proper structure for demo section
+      // Save to DB and create demo fragment
       await step.run("save-result", async () => {
         await prisma.message.create({
           data: {
@@ -361,7 +312,7 @@ export const codeAgentFunction = inngest.createFunction(
             type: "RESULT",
             fragment: {
               create: {
-                sandboxUrl: sandboxUrl,
+                sandboxUrl,
                 title: "Generated App",
                 files: generatedFiles,
               },
@@ -371,6 +322,23 @@ export const codeAgentFunction = inngest.createFunction(
         console.log(`[DB] Saved message with sandbox URL: ${sandboxUrl}`);
         console.log(`[DB] Saved ${Object.keys(generatedFiles).length} files`);
       });
+
+      // If only one standalone HTML file exists, also return inline preview data
+      const fileEntries = Object.entries(generatedFiles);
+      const isSingleHTML = fileEntries.length === 1 && fileEntries[0][0].endsWith('.html');
+      if (isSingleHTML) {
+        const [fileName, htmlContent] = fileEntries[0];
+        return {
+          success: true,
+          inline: true,
+          fileName,
+          htmlContent,
+          previewUrl: `data:text/html;base64,${Buffer.from(htmlContent).toString('base64')}`,
+          url: sandboxUrl,
+          files: generatedFiles,
+          fileCount: Object.keys(generatedFiles).length,
+        };
+      }
 
       return {
         success: true,
@@ -395,7 +363,6 @@ export const codeAgentFunction = inngest.createFunction(
       return { error: true, message: "Unknown error occurred" };
     } finally {
       console.log("[Sandbox] Keeping sandbox alive for preview");
-      // Don't kill the sandbox - keep it running for the demo!
     }
   }
 );
