@@ -14,40 +14,29 @@ const SANDBOX_TEMPLATE_ID = "2kmaga44jttvxphjuxkz";
  * Returns just the hostname (no protocol). Throw if not resolvable.
  */
 function getSandboxHostname(sandbox: Sandbox): string {
-  // 1) Newer SDK: id or sandboxID -> e.g. "k0wmnzir0..."
-  const asAny = sandbox as any;
-  const sandboxId = asAny.id ?? asAny.sandboxID ?? asAny.sandboxId;
-  if (sandboxId && typeof sandboxId === "string") {
-    // many e2b setups map id -> <id>.e2b.dev or similar; prefer id without protocol
-    return `${sandboxId}.e2b.dev`;
+  const s = sandbox as any;
+
+  // 1. New SDK uses sandboxDomain
+  if (s.sandboxDomain) return s.sandboxDomain;
+
+  // 2. Fallback: getConnectionInfo() → hostname/host
+  if (typeof s.getConnectionInfo === "function") {
+    const info = s.getConnectionInfo();
+    if (info?.hostname) return info.hostname;
+    if (info?.host) return info.host;
   }
 
-  // 2) Common SDK methods
-  if (typeof asAny.getHostname === "function") {
-    const val = asAny.getHostname();
-    if (val) return String(val);
-  }
-  if (typeof asAny.getHost === "function") {
-    const val = asAny.getHost();
-    if (val) return String(val);
-  }
+  // 3. Direct props (older SDKs)
+  if (s.hostname) return s.hostname;
+  if (s.host) return s.host;
 
-  // 3) Properties
-  if (asAny.host) return String(asAny.host);
-  if (asAny.hostname) return String(asAny.hostname);
+  // 4. Last fallback
+  const id = s.id || s.sandboxId || s.sandboxID;
+  if (id) return `${id}.e2b.dev`;
 
-  // 4) metadata
-  if (asAny.metadata?.hostname) return String(asAny.metadata.hostname);
-  if (asAny.metadata?.host) return String(asAny.metadata.host);
-
-  // Nothing found -> give detailed diagnostic info in thrown error
-  const keys = Object.keys(asAny).slice(0, 50);
-  throw new Error(
-    `Unable to resolve sandbox hostname. Sandbox keys: [${keys.join(
-      ", "
-    )}]. Check SDK version.`
-  );
+  throw new Error("Unable to resolve sandbox hostname");
 }
+
 
 /**
  * Helper to get full URL (prefers https, app server uses port 3000 for HTML)
@@ -84,6 +73,7 @@ export const codeAgentFunction = inngest.createFunction(
           console.log("[Sandbox] example props:", {
             id: asAny.id ?? asAny.sandboxID ?? asAny.sandboxId,
             host: asAny.host ?? asAny.hostname,
+            domain: asAny.sandboxDomain,
             hasGetHost: typeof asAny.getHost === "function",
             hasGetHostname: typeof asAny.getHostname === "function",
             metadata: asAny.metadata ? "(present)" : "(none)",
@@ -97,7 +87,7 @@ export const codeAgentFunction = inngest.createFunction(
 
       /* ---------------- LangChain model ---------------- */
       const model = new ChatOpenAI({
-        modelName: process.env.LLM_MODEL ?? "qwen/qwen3-coder:free",
+        modelName: process.env.LLM_MODEL ?? "microsoft/mai-ds-r1:free",
         openAIApiKey: process.env.OPENROUTER_API_KEY,
         configuration: { baseURL: "https://openrouter.ai/api/v1" },
         temperature: 0.2,
