@@ -1,3 +1,4 @@
+/* src/inngest/langchain-function.ts */
 import { inngest } from "./client";
 import { ChatOpenAI } from "@langchain/openai";
 import { DynamicStructuredTool } from "@langchain/core/tools";
@@ -8,28 +9,55 @@ import { Sandbox } from "@e2b/code-interpreter";
 
 const SANDBOX_TEMPLATE_ID = "2kmaga44jttvxphjuxkz";
 
-// ✅ DEFINE THIS HELPER FUNCTION OUTSIDE AND BEFORE THE MAIN FUNCTION
-function getSandboxUrl(sandbox: Sandbox): string {
-  // Try different methods the E2B SDK might use
-  if (typeof sandbox.getHostname === 'function') {
-    const host = sandbox.getHostname();
-    console.log('[Sandbox] Using getHostname():', host);
-    return host;
+/**
+ * Try several possible ways to get a sandbox host/hostname from different E2B SDK shapes.
+ * Returns just the hostname (no protocol). Throw if not resolvable.
+ */
+function getSandboxHostname(sandbox: Sandbox): string {
+  // 1) Newer SDK: id or sandboxID -> e.g. "k0wmnzir0..."
+  const asAny = sandbox as any;
+  const sandboxId = asAny.id ?? asAny.sandboxID ?? asAny.sandboxId;
+  if (sandboxId && typeof sandboxId === "string") {
+    // many e2b setups map id -> <id>.e2b.dev or similar; prefer id without protocol
+    return `${sandboxId}.e2b.dev`;
   }
-  if (typeof sandbox.getHost === 'function') {
-    const host = sandbox.getHost();
-    console.log('[Sandbox] Using getHost():', host);
-    return host;
+
+  // 2) Common SDK methods
+  if (typeof asAny.getHostname === "function") {
+    const val = asAny.getHostname();
+    if (val) return String(val);
   }
-  if (sandbox.host) {
-    console.log('[Sandbox] Using .host property:', sandbox.host);
-    return sandbox.host;
+  if (typeof asAny.getHost === "function") {
+    const val = asAny.getHost();
+    if (val) return String(val);
   }
-  
-  // Fallback - check the actual object
-  console.error('[Sandbox] Could not find hostname. Available keys:', Object.keys(sandbox));
-  console.error('[Sandbox] Sandbox type:', typeof sandbox);
-  throw new Error('Unable to get sandbox hostname');
+
+  // 3) Properties
+  if (asAny.host) return String(asAny.host);
+  if (asAny.hostname) return String(asAny.hostname);
+
+  // 4) metadata
+  if (asAny.metadata?.hostname) return String(asAny.metadata.hostname);
+  if (asAny.metadata?.host) return String(asAny.metadata.host);
+
+  // Nothing found -> give detailed diagnostic info in thrown error
+  const keys = Object.keys(asAny).slice(0, 50);
+  throw new Error(
+    `Unable to resolve sandbox hostname. Sandbox keys: [${keys.join(
+      ", "
+    )}]. Check SDK version.`
+  );
+}
+
+/**
+ * Helper to get full URL (prefers https, app server uses port 3000 for HTML)
+ */
+function buildSandboxUrl(hostname: string, port?: number) {
+  // if hostname already has protocol, strip it
+  const stripped = String(hostname).replace(/^https?:\/\//, "");
+  if (port) return `https://${stripped}:${port}`;
+  // default to https host root
+  return `https://${stripped}`;
 }
 
 export const codeAgentFunction = inngest.createFunction(
@@ -39,29 +67,35 @@ export const codeAgentFunction = inngest.createFunction(
     let sandbox: Sandbox | null = null;
 
     try {
-      // 1️⃣ Create E2B Sandbox
+      /* ---------------- Create sandbox ---------------- */
       sandbox = (await step.run("create-sandbox", async () => {
         console.log("[Sandbox] Creating E2B sandbox...");
         const sbx = await Sandbox.create(SANDBOX_TEMPLATE_ID, {
           timeoutMs: 900_000,
           metadata: { projectId: event.data.projectId },
         });
-        
-        console.log(`[Sandbox] Created successfully`);
-        console.log(`[Sandbox] Available methods:`, Object.keys(sbx));
-        
-        // Debug: Try to get hostname
+
+        // Debug summary of created sandbox
         try {
-          const testHost = getSandboxUrl(sbx);
-          console.log(`[Sandbox] Hostname resolved: ${testHost}`);
+          // Print top-level keys and important props
+          const keys = Object.keys(sbx as any).slice(0, 40);
+          console.log("[Sandbox] created object keys:", keys);
+          const asAny = sbx as any;
+          console.log("[Sandbox] example props:", {
+            id: asAny.id ?? asAny.sandboxID ?? asAny.sandboxId,
+            host: asAny.host ?? asAny.hostname,
+            hasGetHost: typeof asAny.getHost === "function",
+            hasGetHostname: typeof asAny.getHostname === "function",
+            metadata: asAny.metadata ? "(present)" : "(none)",
+          });
         } catch (err) {
-          console.error(`[Sandbox] Failed to get hostname:`, err);
+          console.warn("[Sandbox] debug print failed:", err);
         }
-        
+
         return sbx;
       })) as unknown as Sandbox;
 
-      // 2️⃣ Initialize LangChain Model
+      /* ---------------- LangChain model ---------------- */
       const model = new ChatOpenAI({
         modelName: process.env.LLM_MODEL ?? "qwen/qwen3-coder:free",
         openAIApiKey: process.env.OPENROUTER_API_KEY,
@@ -69,10 +103,10 @@ export const codeAgentFunction = inngest.createFunction(
         temperature: 0.2,
       });
 
-      // 3️⃣ Define Tools
+      /* ---------------- Tools ---------------- */
       const terminalTool = new DynamicStructuredTool({
         name: "terminal",
-        description: "Run terminal commands inside sandbox (e.g., npm install)",
+        description: "Run terminal commands inside sandbox",
         schema: z.object({ command: z.string() }),
         func: async ({ command }) => {
           console.log(`[Tool: terminal] ${command}`);
@@ -81,7 +115,8 @@ export const codeAgentFunction = inngest.createFunction(
               onStdout: (d: string) => console.log(`[stdout] ${d}`),
               onStderr: (d: string) => console.error(`[stderr] ${d}`),
             });
-            return proc.stdout || proc.stderr || "Command executed successfully";
+            // many sdk shapes: prefer stdout, fallback to proc.output/stdout-like shapes
+            return (proc.stdout ?? (proc as any).output ?? (proc as any).stdout) || "OK";
           } catch (error: unknown) {
             const errMsg = error instanceof Error ? error.message : String(error);
             return `Error: ${errMsg}`;
@@ -135,7 +170,7 @@ export const codeAgentFunction = inngest.createFunction(
 
       const modelWithTools = model.bindTools([terminalTool, fileWriteTool, readFilesTool]);
 
-      // 4️⃣ Load Previous Messages
+      /* ---------------- Load previous messages ---------------- */
       const previousMessages = await step.run("load-msgs", async () => {
         const msgs = await prisma.message.findMany({
           where: { projectId: event.data.projectId },
@@ -148,241 +183,214 @@ export const codeAgentFunction = inngest.createFunction(
         }));
       });
 
-      // 5️⃣ Build Conversation
+      /* ---------------- Build conversation ---------------- */
       const messages: any[] = [
         { role: "system", content: PROMPT },
         ...previousMessages,
         { role: "user", content: event.data.value },
       ];
 
-      // 6️⃣ Agent Tool-Use Loop
-      let iterations = 0;
-      const maxIterations = 20;
-      let response: any;
-      let finalResponse = "";
-      let allAssistantMessages: string[] = [];
-
+      /* ---------------- Agent tool loop (with protections) ---------------- */
       console.log("[Agent] Starting tool loop...");
+      let iterations = 0;
+      const maxIterations = 10; // reduced to prevent rate-limits
+      let consecutiveNoProgress = 0;
+      const maxNoProgress = 3;
+      let response: any;
+      let lastText = "";
+      const assistantTexts: string[] = [];
 
       while (iterations < maxIterations) {
         response = await modelWithTools.invoke(messages);
 
-        if (response.content) {
-          const textContent = typeof response.content === "string" 
-            ? response.content 
-            : JSON.stringify(response.content);
-          
-          if (textContent.trim()) {
-            allAssistantMessages.push(textContent);
-            finalResponse = textContent;
+        // capture any assistant text
+        if (response?.content) {
+          const text = typeof response.content === "string" ? response.content : JSON.stringify(response.content);
+          if (text.trim()) {
+            assistantTexts.push(text);
+            lastText = text;
+            messages.push({ role: "assistant", content: text });
           }
-          
-          messages.push({ role: "assistant", content: response.content });
         }
 
-        if (response.tool_calls?.length) {
-          messages.push({
-            role: "assistant",
-            content: "",
-            tool_calls: response.tool_calls
-          });
+        // if no tool calls -> done
+        const toolCalls = response?.tool_calls ?? [];
+        if (!toolCalls.length) {
+          consecutiveNoProgress++;
+          if (consecutiveNoProgress >= maxNoProgress) {
+            console.log("[Agent] No progress for several iterations - breaking");
+            break;
+          }
+          // If no tool calls but we got content, we can end
+          if (lastText) {
+            console.log("[Agent] No tool calls and assistant gave content -> done");
+            break;
+          }
+        } else {
+          consecutiveNoProgress = 0;
         }
 
-        if (!response.tool_calls?.length) {
-          console.log("[Agent] No more tool calls - task complete ✅");
-          break;
-        }
-
-        for (const toolCall of response.tool_calls) {
+        // execute tool calls
+        for (const toolCall of toolCalls) {
           let toolResult = "";
-          
           switch (toolCall.name) {
             case "terminal":
               toolResult = await terminalTool.func(toolCall.args as { command: string });
               break;
             case "createOrUpdateFiles":
-              toolResult = await fileWriteTool.func(
-                toolCall.args as { files: { path: string; content: string }[] }
-              );
+              toolResult = await fileWriteTool.func(toolCall.args as { files: { path: string; content: string }[] });
               break;
             case "readFiles":
               toolResult = await readFilesTool.func(toolCall.args as { paths: string[] });
               break;
             default:
-              toolResult = "Unknown tool";
+              toolResult = `Unknown tool: ${toolCall.name}`;
           }
-
-          messages.push({
-            role: "tool",
-            content: toolResult,
-            tool_call_id: toolCall.id,
-          });
+          messages.push({ role: "tool", content: toolResult, tool_call_id: toolCall.id });
         }
 
         iterations++;
       }
 
-      if (!finalResponse.trim()) {
-        console.log("[Agent] No final response, requesting summary...");
+      if (!lastText) {
+        // Ask for a short summary
+        console.log("[Agent] No final assistant text - requesting summary");
         const summaryResp = await model.invoke([
           ...messages,
-          { role: "user", content: "Please provide a brief summary of what you've built and any important details." }
+          { role: "user", content: "Please provide a short summary of what you built." },
         ]);
-        finalResponse = typeof summaryResp.content === "string" 
-          ? summaryResp.content 
-          : JSON.stringify(summaryResp.content);
-        allAssistantMessages.push(finalResponse);
+        lastText = typeof summaryResp.content === "string" ? summaryResp.content : JSON.stringify(summaryResp.content);
+        assistantTexts.push(lastText);
       }
 
-      const completeResponse = allAssistantMessages.join("\n\n");
+      const combinedAssistant = assistantTexts.join("\n\n");
 
-      // 7️⃣ Read Generated Files
+      /* ---------------- Read generated files from sandbox ---------------- */
       const generatedFiles = await step.run("read-files", async () => {
         const files: Record<string, string> = {};
-        
-        const filesToRead = [
-          "app/page.tsx",
-          "app/layout.tsx",
-          "tailwind.config.ts",
-          "package.json",
+        // Check a set of common file locations (absolute)
+        const baseCandidates = [
+          "/home/user/app/page.tsx",
+          "/home/user/app/layout.tsx",
+          "/home/user/tailwind.config.ts",
+          "/home/user/package.json",
         ];
 
-        try {
-          const appFiles = await sandbox!.fs.list("/home/user/app");
-          for (const file of appFiles) {
-            if (!file.isDir && /\.(tsx?|jsx?|json|html|css)$/.test(file.name)) {
-              filesToRead.push(`app/${file.name}`);
-            }
-          }
-        } catch {
-          console.log("[Files] Could not list app directory");
-        }
-
-        try {
-          const rootFiles = await sandbox!.fs.list("/home/user");
-          for (const file of rootFiles) {
-            if (!file.isDir && /\.(html?|tsx?|jsx?|json|css)$/.test(file.name)) {
-              filesToRead.push(file.name);
-            }
-          }
-        } catch {
-          console.log("[Files] Could not list root directory");
-        }
-
-        for (const filePath of [...new Set(filesToRead)]) {
+        for (const fullPath of baseCandidates) {
           try {
-            const fullPath = `/home/user/${filePath}`;
-            const content = await sandbox!.fs.read(fullPath);
-            files[filePath] = content;
-            console.log(`[Files] ✅ Read: ${filePath}`);
+            const c = await sandbox!.fs.read(fullPath);
+            const rel = fullPath.replace(/^\/home\/user\//, "");
+            files[rel] = c;
+            console.log(`[Files] Read base: ${rel}`);
           } catch {
-            // File doesn't exist, skip
+            // ignore
           }
+        }
+
+        // Discover files in /home/user/app
+        try {
+          const appList = await sandbox!.fs.list("/home/user/app");
+          for (const file of appList) {
+            if (!file.isDir && /\.(tsx?|jsx?|json|css|html)$/.test(file.name)) {
+              const p = `/home/user/app/${file.name}`;
+              try {
+                const c = await sandbox!.fs.read(p);
+                files[`app/${file.name}`] = c;
+                console.log(`[Files] Discovered app/${file.name}`);
+              } catch {}
+            }
+          }
+        } catch {
+          console.log("[Files] Could not list /home/user/app");
+        }
+
+        // Discover root-level files
+        try {
+          const rootList = await sandbox!.fs.list("/home/user");
+          for (const file of rootList) {
+            if (!file.isDir && /\.(html?|tsx?|jsx?|json|css)$/.test(file.name)) {
+              const p = `/home/user/${file.name}`;
+              try {
+                const c = await sandbox!.fs.read(p);
+                files[file.name] = c;
+                console.log(`[Files] Discovered ${file.name}`);
+              } catch {}
+            }
+          }
+        } catch {
+          console.log("[Files] Could not list /home/user");
         }
 
         console.log(`[Files] Total files read: ${Object.keys(files).length}`);
-        console.log(`[Files] File paths:`, Object.keys(files));
         return files;
       });
 
-      // 8️⃣ Determine App Type and Start Server
-      const hasHtmlFiles = Object.keys(generatedFiles).some((f) => f.endsWith(".html"));
-      const hasNextjsApp = Boolean(
-        generatedFiles["app/page.tsx"] && generatedFiles["package.json"]
-      );
+      /* ---------------- Start app / determine preview URL ---------------- */
+      const hasHtml = Object.keys(generatedFiles).some((f) => f.endsWith(".html"));
+      const hasNext = Boolean(generatedFiles["app/page.tsx"] && generatedFiles["package.json"]);
 
       let sandboxUrl = "";
+      const hostname = getSandboxHostname(sandbox!); // may throw
 
-      if (hasNextjsApp) {
+      if (hasNext) {
+        // Try start Next dev server on port 3000 and wait
         await step.run("start-nextjs", async () => {
-          console.log("[Server] Starting Next.js dev server...");
-          
           try {
-            await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
-          } catch {
-            // Ignore errors
-          }
-          
-          sandbox!.process?.start?.({
-            cmd: "cd /home/user && npm run dev -- --turbo --port 3000",
-            onStdout: (d: string) => console.log(`[Server] ${d}`),
-            onStderr: (d: string) => console.error(`[Server] ${d}`),
-          });
-
-          let attempts = 0;
-          const maxAttempts = 40;
-          const hostName = getSandboxUrl(sandbox!);
-          
-          while (attempts < maxAttempts) {
+            // kill process on port if any (best-effort)
             try {
-              const res = await fetch(`https://${hostName}/`, { 
-                method: "HEAD",
-                signal: AbortSignal.timeout(5000)
-              });
-              if (res.ok) {
-                console.log("[Server] ✅ Next.js server is ready");
-                return;
+              await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
+            } catch {}
+            sandbox!.process?.start?.({
+              cmd: "cd /home/user && npm run dev -- --port 3000",
+              onStdout: (d: string) => console.log(`[Server] ${d}`),
+              onStderr: (d: string) => console.error(`[Server] ${d}`),
+            });
+            // Wait for server up
+            let tries = 0;
+            const maxTries = 30;
+            while (tries < maxTries) {
+              try {
+                const res = await fetch(buildSandboxUrl(hostname, 3000), { method: "HEAD", signal: AbortSignal.timeout(3000) });
+                if (res.ok) break;
+              } catch {
+                // retry
               }
-            } catch (err) {
-              console.log(`[Server] Attempt ${attempts + 1}/${maxAttempts}...`);
+              await new Promise((r) => setTimeout(r, 2000));
+              tries++;
             }
-            await new Promise((r) => setTimeout(r, 3000));
-            attempts++;
+          } catch (err) {
+            console.warn("[Server] starting Next.js failed:", err);
           }
-
-          console.warn("[Server] ⚠️ Server may not be fully ready yet, but continuing...");
         });
-        
-        const hostName = getSandboxUrl(sandbox);
-        sandboxUrl = `https://${hostName}`;
-        
-      } else if (hasHtmlFiles) {
+        sandboxUrl = buildSandboxUrl(hostname, 3000);
+      } else if (hasHtml) {
         await step.run("start-http-server", async () => {
-          console.log("[Server] Starting HTTP server for HTML...");
-          
           try {
             await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
-          } catch {
-            // Ignore errors
-          }
-          
+          } catch {}
           sandbox!.process?.start?.({
             cmd: "cd /home/user && python3 -m http.server 3000",
             onStdout: (d: string) => console.log(`[Server] ${d}`),
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
-
-          await new Promise((r) => setTimeout(r, 5000));
+          await new Promise((r) => setTimeout(r, 3000));
         });
 
+        // choose index.html if present
         const htmlFiles = Object.keys(generatedFiles).filter((f) => f.endsWith(".html"));
-        const mainHtmlFile = 
-          htmlFiles.find((f) => /index\.html$/i.test(f)) || 
-          htmlFiles[0];
-        
-        const hostName = getSandboxUrl(sandbox);
-        sandboxUrl = mainHtmlFile 
-          ? `https://${hostName}:3000/${mainHtmlFile}`
-          : `https://${hostName}:3000`;
-        console.log(`[Server] ✅ HTML server ready: ${sandboxUrl}`);
-        
+        const entry = htmlFiles.find((f) => /index\.html$/i.test(f)) ?? htmlFiles[0];
+        sandboxUrl = entry ? `${buildSandboxUrl(hostname, 3000)}/${entry}` : buildSandboxUrl(hostname, 3000);
       } else {
-        const hostName = getSandboxUrl(sandbox);
-        sandboxUrl = `https://${hostName}`;
-        console.warn("[Server] ⚠️ No Next.js or HTML files detected");
+        sandboxUrl = buildSandboxUrl(hostname);
       }
 
-      // 9️⃣ Save to Database
+      /* ---------------- Save to DB ---------------- */
       await step.run("save-to-db", async () => {
-        const messageContent = completeResponse || finalResponse || "✅ App built successfully!";
-        
-        console.log(`[DB] Saving with URL: ${sandboxUrl}`);
-        console.log(`[DB] Files to save:`, Object.keys(generatedFiles).length);
-        
+        const messageContent = combinedAssistant || lastText || "✅ App built successfully!";
         await prisma.message.create({
           data: {
             projectId: event.data.projectId,
-            content: messageContent,
+            content: String(messageContent),
             role: "ASSISTANT",
             type: "RESULT",
             fragment: {
@@ -394,42 +402,34 @@ export const codeAgentFunction = inngest.createFunction(
             },
           },
         });
-        
-        console.log(`[DB] ✅ Saved message with ${messageContent.length} chars`);
-        console.log(`[DB] ✅ Sandbox URL: ${sandboxUrl}`);
-        console.log(`[DB] ✅ Files saved: ${Object.keys(generatedFiles).length}`);
+        console.log(`[DB] Saved message, sandboxUrl=${sandboxUrl}, files=${Object.keys(generatedFiles).length}`);
       });
 
-      // 🔟 Return Result
       return {
         success: true,
         url: sandboxUrl,
-        response: completeResponse || finalResponse,
+        response: combinedAssistant || lastText,
         files: generatedFiles,
         fileCount: Object.keys(generatedFiles).length,
       };
-
     } catch (err: unknown) {
       const error = err as Error;
       console.error("❌ [Agent Error]:", error);
-      
-      await prisma.message.create({
-        data: {
-          projectId: event.data?.projectId ?? "unknown",
-          content: `Error: ${error.message}\n\nStack: ${error.stack}`,
-          role: "ASSISTANT",
-          type: "ERROR",
-        },
-      });
-
-      return { 
-        error: true, 
-        message: error.message,
-        stack: error.stack 
-      };
-      
+      try {
+        await prisma.message.create({
+          data: {
+            projectId: event.data?.projectId ?? "unknown",
+            content: `Error: ${error.message}\n\nStack: ${error.stack}`,
+            role: "ASSISTANT",
+            type: "ERROR",
+          },
+        });
+      } catch (e) {
+        console.error("[DB] Failed to record error:", e);
+      }
+      return { error: true, message: error.message };
     } finally {
-      console.log("[Sandbox] Keeping sandbox alive for user preview");
+      console.log("[Sandbox] Keeping sandbox alive for preview");
     }
   }
 );
