@@ -8,6 +8,30 @@ import { Sandbox } from "@e2b/code-interpreter";
 
 const SANDBOX_TEMPLATE_ID = "2kmaga44jttvxphjuxkz";
 
+// ✅ DEFINE THIS HELPER FUNCTION OUTSIDE AND BEFORE THE MAIN FUNCTION
+function getSandboxUrl(sandbox: Sandbox): string {
+  // Try different methods the E2B SDK might use
+  if (typeof sandbox.getHostname === 'function') {
+    const host = sandbox.getHostname();
+    console.log('[Sandbox] Using getHostname():', host);
+    return host;
+  }
+  if (typeof sandbox.getHost === 'function') {
+    const host = sandbox.getHost();
+    console.log('[Sandbox] Using getHost():', host);
+    return host;
+  }
+  if (sandbox.host) {
+    console.log('[Sandbox] Using .host property:', sandbox.host);
+    return sandbox.host;
+  }
+  
+  // Fallback - check the actual object
+  console.error('[Sandbox] Could not find hostname. Available keys:', Object.keys(sandbox));
+  console.error('[Sandbox] Sandbox type:', typeof sandbox);
+  throw new Error('Unable to get sandbox hostname');
+}
+
 export const codeAgentFunction = inngest.createFunction(
   { id: "code-agent", retries: 0 },
   { event: "code-agent/run" },
@@ -22,7 +46,18 @@ export const codeAgentFunction = inngest.createFunction(
           timeoutMs: 900_000,
           metadata: { projectId: event.data.projectId },
         });
-        console.log(`[Sandbox] Created successfully: ${sbx.host}`);
+        
+        console.log(`[Sandbox] Created successfully`);
+        console.log(`[Sandbox] Available methods:`, Object.keys(sbx));
+        
+        // Debug: Try to get hostname
+        try {
+          const testHost = getSandboxUrl(sbx);
+          console.log(`[Sandbox] Hostname resolved: ${testHost}`);
+        } catch (err) {
+          console.error(`[Sandbox] Failed to get hostname:`, err);
+        }
+        
         return sbx;
       })) as unknown as Sandbox;
 
@@ -132,7 +167,6 @@ export const codeAgentFunction = inngest.createFunction(
       while (iterations < maxIterations) {
         response = await modelWithTools.invoke(messages);
 
-        // Capture ALL assistant text responses
         if (response.content) {
           const textContent = typeof response.content === "string" 
             ? response.content 
@@ -140,13 +174,12 @@ export const codeAgentFunction = inngest.createFunction(
           
           if (textContent.trim()) {
             allAssistantMessages.push(textContent);
-            finalResponse = textContent; // Keep updating with latest
+            finalResponse = textContent;
           }
           
           messages.push({ role: "assistant", content: response.content });
         }
 
-        // Add tool calls to messages if present
         if (response.tool_calls?.length) {
           messages.push({
             role: "assistant",
@@ -155,13 +188,11 @@ export const codeAgentFunction = inngest.createFunction(
           });
         }
 
-        // Check if there are tool calls
         if (!response.tool_calls?.length) {
           console.log("[Agent] No more tool calls - task complete ✅");
           break;
         }
 
-        // Execute all tool calls
         for (const toolCall of response.tool_calls) {
           let toolResult = "";
           
@@ -191,7 +222,6 @@ export const codeAgentFunction = inngest.createFunction(
         iterations++;
       }
 
-      // If no final response, request summary
       if (!finalResponse.trim()) {
         console.log("[Agent] No final response, requesting summary...");
         const summaryResp = await model.invoke([
@@ -204,7 +234,6 @@ export const codeAgentFunction = inngest.createFunction(
         allAssistantMessages.push(finalResponse);
       }
 
-      // Combine all assistant messages for a complete response
       const completeResponse = allAssistantMessages.join("\n\n");
 
       // 7️⃣ Read Generated Files
@@ -218,7 +247,6 @@ export const codeAgentFunction = inngest.createFunction(
           "package.json",
         ];
 
-        // List app directory
         try {
           const appFiles = await sandbox!.fs.list("/home/user/app");
           for (const file of appFiles) {
@@ -230,7 +258,6 @@ export const codeAgentFunction = inngest.createFunction(
           console.log("[Files] Could not list app directory");
         }
 
-        // List root directory
         try {
           const rootFiles = await sandbox!.fs.list("/home/user");
           for (const file of rootFiles) {
@@ -242,7 +269,6 @@ export const codeAgentFunction = inngest.createFunction(
           console.log("[Files] Could not list root directory");
         }
 
-        // Read all files
         for (const filePath of [...new Set(filesToRead)]) {
           try {
             const fullPath = `/home/user/${filePath}`;
@@ -255,6 +281,7 @@ export const codeAgentFunction = inngest.createFunction(
         }
 
         console.log(`[Files] Total files read: ${Object.keys(files).length}`);
+        console.log(`[Files] File paths:`, Object.keys(files));
         return files;
       });
 
@@ -270,7 +297,6 @@ export const codeAgentFunction = inngest.createFunction(
         await step.run("start-nextjs", async () => {
           console.log("[Server] Starting Next.js dev server...");
           
-          // Kill any existing processes on port 3000
           try {
             await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
           } catch {
@@ -283,13 +309,13 @@ export const codeAgentFunction = inngest.createFunction(
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
 
-          // Wait for server with better error handling
           let attempts = 0;
-          const maxAttempts = 40; // Increase attempts
+          const maxAttempts = 40;
+          const hostName = getSandboxUrl(sandbox!);
           
           while (attempts < maxAttempts) {
             try {
-              const res = await fetch(`https://${sandbox!.host}/`, { 
+              const res = await fetch(`https://${hostName}/`, { 
                 method: "HEAD",
                 signal: AbortSignal.timeout(5000)
               });
@@ -306,14 +332,14 @@ export const codeAgentFunction = inngest.createFunction(
 
           console.warn("[Server] ⚠️ Server may not be fully ready yet, but continuing...");
         });
-
-        sandboxUrl = `https://${sandbox.host}`;
+        
+        const hostName = getSandboxUrl(sandbox);
+        sandboxUrl = `https://${hostName}`;
         
       } else if (hasHtmlFiles) {
         await step.run("start-http-server", async () => {
           console.log("[Server] Starting HTTP server for HTML...");
           
-          // Kill any existing processes on port 3000
           try {
             await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
           } catch {
@@ -326,27 +352,32 @@ export const codeAgentFunction = inngest.createFunction(
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
 
-          await new Promise((r) => setTimeout(r, 5000)); // Give it more time
+          await new Promise((r) => setTimeout(r, 5000));
         });
 
         const htmlFiles = Object.keys(generatedFiles).filter((f) => f.endsWith(".html"));
         const mainHtmlFile = 
           htmlFiles.find((f) => /index\.html$/i.test(f)) || 
           htmlFiles[0];
-
+        
+        const hostName = getSandboxUrl(sandbox);
         sandboxUrl = mainHtmlFile 
-          ? `https://${sandbox.host}:3000/${mainHtmlFile}`
-          : `https://${sandbox.host}:3000`;
+          ? `https://${hostName}:3000/${mainHtmlFile}`
+          : `https://${hostName}:3000`;
         console.log(`[Server] ✅ HTML server ready: ${sandboxUrl}`);
         
       } else {
-        sandboxUrl = `https://${sandbox.host}`;
+        const hostName = getSandboxUrl(sandbox);
+        sandboxUrl = `https://${hostName}`;
         console.warn("[Server] ⚠️ No Next.js or HTML files detected");
       }
 
       // 9️⃣ Save to Database
       await step.run("save-to-db", async () => {
         const messageContent = completeResponse || finalResponse || "✅ App built successfully!";
+        
+        console.log(`[DB] Saving with URL: ${sandboxUrl}`);
+        console.log(`[DB] Files to save:`, Object.keys(generatedFiles).length);
         
         await prisma.message.create({
           data: {
@@ -363,6 +394,7 @@ export const codeAgentFunction = inngest.createFunction(
             },
           },
         });
+        
         console.log(`[DB] ✅ Saved message with ${messageContent.length} chars`);
         console.log(`[DB] ✅ Sandbox URL: ${sandboxUrl}`);
         console.log(`[DB] ✅ Files saved: ${Object.keys(generatedFiles).length}`);
