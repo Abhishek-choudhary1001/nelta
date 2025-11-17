@@ -6,7 +6,6 @@ import prisma from "@/lib/db";
 import { PROMPT } from "@/prompts";
 import { Sandbox } from "@e2b/code-interpreter";
 
-// ✅ Correct template ID from your e2b.toml
 const SANDBOX_TEMPLATE_ID = "r1xgkdrh3m2a4p8uieu7";
 
 export const codeAgentFunction = inngest.createFunction(
@@ -20,13 +19,12 @@ export const codeAgentFunction = inngest.createFunction(
       sandbox = (await step.run("create-sandbox", async () => {
         console.log("[Sandbox] Creating E2B sandbox...");
         const sbx = await Sandbox.create(SANDBOX_TEMPLATE_ID, {
-          timeoutMs: 600_000,
+          timeoutMs: 900_000,
           metadata: { projectId: event.data.projectId },
         });
-        console.log(`[Sandbox] Created successfully: ${sbx.getHost()}`);
+        console.log(`[Sandbox] Created successfully: ${sbx.host}`);
         return sbx;
       })) as unknown as Sandbox;
-      
 
       // 2️⃣ Initialize LangChain Model
       const model = new ChatOpenAI({
@@ -66,7 +64,6 @@ export const codeAgentFunction = inngest.createFunction(
           console.log(`[Tool] Writing ${files.length} file(s)`);
           try {
             for (const file of files) {
-              // Normalize path - remove /home/user/ if present
               const normalizedPath = file.path.replace(/^\/home\/user\//, "");
               const fullPath = `/home/user/${normalizedPath}`;
               await sandbox!.fs.write(fullPath, file.content);
@@ -101,7 +98,6 @@ export const codeAgentFunction = inngest.createFunction(
         },
       });
 
-      // Bind tools to model
       const modelWithTools = model.bindTools([terminalTool, fileWriteTool, readFilesTool]);
 
       // 4️⃣ Load Previous Messages
@@ -129,18 +125,34 @@ export const codeAgentFunction = inngest.createFunction(
       const maxIterations = 20;
       let response: any;
       let finalResponse = "";
+      let allAssistantMessages: string[] = [];
 
       console.log("[Agent] Starting tool loop...");
 
       while (iterations < maxIterations) {
         response = await modelWithTools.invoke(messages);
 
-        // Capture assistant's text response
+        // Capture ALL assistant text responses
         if (response.content) {
-          finalResponse = typeof response.content === "string" 
+          const textContent = typeof response.content === "string" 
             ? response.content 
             : JSON.stringify(response.content);
-          messages.push({ role: "assistant", content: finalResponse });
+          
+          if (textContent.trim()) {
+            allAssistantMessages.push(textContent);
+            finalResponse = textContent; // Keep updating with latest
+          }
+          
+          messages.push({ role: "assistant", content: response.content });
+        }
+
+        // Add tool calls to messages if present
+        if (response.tool_calls?.length) {
+          messages.push({
+            role: "assistant",
+            content: "",
+            tool_calls: response.tool_calls
+          });
         }
 
         // Check if there are tool calls
@@ -150,7 +162,6 @@ export const codeAgentFunction = inngest.createFunction(
         }
 
         // Execute all tool calls
-        const toolResults: any[] = [];
         for (const toolCall of response.tool_calls) {
           let toolResult = "";
           
@@ -170,33 +181,36 @@ export const codeAgentFunction = inngest.createFunction(
               toolResult = "Unknown tool";
           }
 
-          toolResults.push({
+          messages.push({
             role: "tool",
             content: toolResult,
             tool_call_id: toolCall.id,
           });
         }
 
-        messages.push(...toolResults);
         iterations++;
       }
 
       // If no final response, request summary
       if (!finalResponse.trim()) {
+        console.log("[Agent] No final response, requesting summary...");
         const summaryResp = await model.invoke([
           ...messages,
-          { role: "user", content: "Please summarize what you built." }
+          { role: "user", content: "Please provide a brief summary of what you've built and any important details." }
         ]);
         finalResponse = typeof summaryResp.content === "string" 
           ? summaryResp.content 
           : JSON.stringify(summaryResp.content);
+        allAssistantMessages.push(finalResponse);
       }
+
+      // Combine all assistant messages for a complete response
+      const completeResponse = allAssistantMessages.join("\n\n");
 
       // 7️⃣ Read Generated Files
       const generatedFiles = await step.run("read-files", async () => {
         const files: Record<string, string> = {};
         
-        // Key files to check
         const filesToRead = [
           "app/page.tsx",
           "app/layout.tsx",
@@ -204,7 +218,7 @@ export const codeAgentFunction = inngest.createFunction(
           "package.json",
         ];
 
-        // Try to list app directory
+        // List app directory
         try {
           const appFiles = await sandbox!.fs.list("/home/user/app");
           for (const file of appFiles) {
@@ -216,11 +230,11 @@ export const codeAgentFunction = inngest.createFunction(
           console.log("[Files] Could not list app directory");
         }
 
-        // Try to list root directory for HTML files
+        // List root directory
         try {
           const rootFiles = await sandbox!.fs.list("/home/user");
           for (const file of rootFiles) {
-            if (!file.isDir && /\.html?$/.test(file.name)) {
+            if (!file.isDir && /\.(html?|tsx?|jsx?|json|css)$/.test(file.name)) {
               filesToRead.push(file.name);
             }
           }
@@ -253,48 +267,58 @@ export const codeAgentFunction = inngest.createFunction(
       let sandboxUrl = "";
 
       if (hasNextjsApp) {
-        // Start Next.js dev server
         await step.run("start-nextjs", async () => {
           console.log("[Server] Starting Next.js dev server...");
           
+          // Kill any existing processes on port 3000
+          try {
+            await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
+          } catch {
+            // Ignore errors
+          }
+          
           sandbox!.process?.start?.({
-            cmd: "cd /home/user && npm run dev -- --turbo",
+            cmd: "cd /home/user && npm run dev -- --turbo --port 3000",
             onStdout: (d: string) => console.log(`[Server] ${d}`),
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
 
-          // Wait for server to be ready
+          // Wait for server with better error handling
           let attempts = 0;
-          const maxAttempts = 30;
+          const maxAttempts = 40; // Increase attempts
           
           while (attempts < maxAttempts) {
             try {
-              const res = await fetch(`https://${sandbox!.getHost()}/`, { 
+              const res = await fetch(`https://${sandbox!.host}/`, { 
                 method: "HEAD",
-                signal: AbortSignal.timeout(3000)
+                signal: AbortSignal.timeout(5000)
               });
               if (res.ok) {
                 console.log("[Server] ✅ Next.js server is ready");
-                break;
+                return;
               }
-            } catch {
-              // Retry
+            } catch (err) {
+              console.log(`[Server] Attempt ${attempts + 1}/${maxAttempts}...`);
             }
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, 3000));
             attempts++;
           }
 
-          if (attempts >= maxAttempts) {
-            console.warn("[Server] ⚠️ Server might not be ready yet");
-          }
+          console.warn("[Server] ⚠️ Server may not be fully ready yet, but continuing...");
         });
 
-        sandboxUrl = `https://${sandbox.getHost()}`;
+        sandboxUrl = `https://${sandbox.host}`;
         
       } else if (hasHtmlFiles) {
-        // Start HTTP server for HTML files
         await step.run("start-http-server", async () => {
           console.log("[Server] Starting HTTP server for HTML...");
+          
+          // Kill any existing processes on port 3000
+          try {
+            await sandbox!.commands.run("lsof -ti:3000 | xargs kill -9 || true");
+          } catch {
+            // Ignore errors
+          }
           
           sandbox!.process?.start?.({
             cmd: "cd /home/user && python3 -m http.server 3000",
@@ -302,29 +326,32 @@ export const codeAgentFunction = inngest.createFunction(
             onStderr: (d: string) => console.error(`[Server] ${d}`),
           });
 
-          await new Promise((r) => setTimeout(r, 3000));
+          await new Promise((r) => setTimeout(r, 5000)); // Give it more time
         });
 
-        // Find the main HTML file
         const htmlFiles = Object.keys(generatedFiles).filter((f) => f.endsWith(".html"));
         const mainHtmlFile = 
           htmlFiles.find((f) => /index\.html$/i.test(f)) || 
           htmlFiles[0];
 
-        sandboxUrl = `https://${sandbox.getHost()}/${mainHtmlFile}`;
+        sandboxUrl = mainHtmlFile 
+          ? `https://${sandbox.host}:3000/${mainHtmlFile}`
+          : `https://${sandbox.host}:3000`;
         console.log(`[Server] ✅ HTML server ready: ${sandboxUrl}`);
         
       } else {
-        sandboxUrl = `https://${sandbox.getHost()}`;
+        sandboxUrl = `https://${sandbox.host}`;
         console.warn("[Server] ⚠️ No Next.js or HTML files detected");
       }
 
       // 9️⃣ Save to Database
       await step.run("save-to-db", async () => {
+        const messageContent = completeResponse || finalResponse || "✅ App built successfully!";
+        
         await prisma.message.create({
           data: {
             projectId: event.data.projectId,
-            content: finalResponse || "✅ App built successfully!",
+            content: messageContent,
             role: "ASSISTANT",
             type: "RESULT",
             fragment: {
@@ -336,14 +363,16 @@ export const codeAgentFunction = inngest.createFunction(
             },
           },
         });
-        console.log(`[DB] ✅ Saved with URL: ${sandboxUrl}`);
+        console.log(`[DB] ✅ Saved message with ${messageContent.length} chars`);
+        console.log(`[DB] ✅ Sandbox URL: ${sandboxUrl}`);
+        console.log(`[DB] ✅ Files saved: ${Object.keys(generatedFiles).length}`);
       });
 
       // 🔟 Return Result
       return {
         success: true,
         url: sandboxUrl,
-        response: finalResponse,
+        response: completeResponse || finalResponse,
         files: generatedFiles,
         fileCount: Object.keys(generatedFiles).length,
       };
@@ -355,7 +384,7 @@ export const codeAgentFunction = inngest.createFunction(
       await prisma.message.create({
         data: {
           projectId: event.data?.projectId ?? "unknown",
-          content: `Error: ${error.message}`,
+          content: `Error: ${error.message}\n\nStack: ${error.stack}`,
           role: "ASSISTANT",
           type: "ERROR",
         },
@@ -368,7 +397,6 @@ export const codeAgentFunction = inngest.createFunction(
       };
       
     } finally {
-      // Keep sandbox alive for preview
       console.log("[Sandbox] Keeping sandbox alive for user preview");
     }
   }
