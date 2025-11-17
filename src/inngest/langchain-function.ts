@@ -6,7 +6,7 @@ import prisma from "@/lib/db";
 import { PROMPT } from "@/prompts";
 import { Sandbox } from "@e2b/code-interpreter";
 
-const SANDBOX_TEMPLATE_ID = "r1xgkdrh3m2a4p8uieu7";
+const SANDBOX_TEMPLATE_ID = "2kmaga44jttvxphjuxkz";
 
 export const codeAgentFunction = inngest.createFunction(
   { id: "code-agent", retries: 0 },
