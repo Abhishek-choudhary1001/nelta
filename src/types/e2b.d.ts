@@ -1,4 +1,4 @@
-// src/types/e2b.d.ts - Updated with correct E2B SDK API
+// src/types/e2b.d.ts - Updated for latest E2B SDK versions
 
 declare module "@e2b/code-interpreter" {
   export type EntryInfo = {
@@ -11,6 +11,7 @@ declare module "@e2b/code-interpreter" {
   export type CommandOutput = {
     stdout?: string | null;
     stderr?: string | null;
+    output?: string | null;
   };
 
   export type CommandResult = {
@@ -21,6 +22,14 @@ declare module "@e2b/code-interpreter" {
     stderr?: string | null;
   };
 
+  // Modern filesystem API
+  export interface SandboxFilesystem {
+    write(path: string, content: string | Uint8Array): Promise<void>;
+    read(path: string): Promise<string>;
+    list(path: string): Promise<EntryInfo[]>;
+  }
+
+  // Legacy fs API (older versions)
   export interface SandboxFS {
     write(path: string, content: string | Uint8Array): Promise<void>;
     read(path: string): Promise<string>;
@@ -47,16 +56,27 @@ declare module "@e2b/code-interpreter" {
   }
 
   export interface Sandbox {
-    // Different E2B versions use different methods:
-    getHostname?(): string;  // Most common in recent versions
-    getHost?(): string;      // Alternative method name
-    host?: string;           // Property in older versions
+    // Hostname methods (different across versions)
+    getHostname?(): string;
+    getHost?(): string;
+    host?: string;
+    hostname?: string;
+    id?: string;
+    sandboxId?: string;
+    sandboxID?: string;
     
+    // File system (multiple possible APIs)
+    filesystem?: SandboxFilesystem;  // Modern API
+    fs?: SandboxFS;                  // Legacy API
+    files?: SandboxFS;               // Alternative legacy API
+    
+    // Commands
     commands: SandboxCommands;
-    process?: SandboxProcess;
-    fs: SandboxFS;
-    files?: SandboxFS;
     
+    // Process management
+    process?: SandboxProcess;
+    
+    // Lifecycle
     close?(): Promise<void>;
     setTimeout?(ms: number): Promise<void>;
     
