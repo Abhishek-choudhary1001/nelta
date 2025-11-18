@@ -87,7 +87,7 @@ export const codeAgentFunction = inngest.createFunction(
 
       /* ---------------- LangChain model ---------------- */
       const model = new ChatOpenAI({
-        modelName: process.env.LLM_MODEL ?? "microsoft/mai-ds-r1:free",
+        modelName: process.env.LLM_MODEL ?? "kwaipilot/kat-coder-pro:free",
         openAIApiKey: process.env.OPENROUTER_API_KEY,
         configuration: { baseURL: "https://openrouter.ai/api/v1" },
         temperature: 0.2,
@@ -314,7 +314,9 @@ export const codeAgentFunction = inngest.createFunction(
         console.log(`[Files] Total files read: ${Object.keys(files).length}`);
         return files;
       });
+   
 
+      
       /* ---------------- Start app / determine preview URL ---------------- */
       const hasHtml = Object.keys(generatedFiles).some((f) => f.endsWith(".html"));
       const hasNext = Boolean(generatedFiles["app/page.tsx"] && generatedFiles["package.json"]);
