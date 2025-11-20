@@ -56,25 +56,26 @@ declare module "@e2b/code-interpreter" {
   }
 
   export interface Sandbox {
-    // Hostname methods (different across versions)
+    // v2.x sandbox identification
+    readonly sandboxId: string;
+    readonly sandboxDomain: string;
+    
+    // Legacy properties (for backwards compatibility)
     getHostname?(): string;
     getHost?(): string;
     host?: string;
     hostname?: string;
     id?: string;
-    sandboxId?: string;
-    sandboxID?: string;
     
-    // File system (multiple possible APIs)
-    filesystem?: SandboxFilesystem;  // Modern API
-    fs?: SandboxFS;                  // Legacy API
-    files?: SandboxFS;               // Alternative legacy API
+    // File system - v2.x uses 'files' (required)
+    files: {
+      write(path: string, content: string | Uint8Array): Promise<void>;
+      read(path: string): Promise<string>;
+      list(path: string): Promise<EntryInfo[]>;
+    };
     
-    // Commands
+    // Commands (required)
     commands: SandboxCommands;
-    
-    // Process management
-    process?: SandboxProcess;
     
     // Lifecycle
     close?(): Promise<void>;
