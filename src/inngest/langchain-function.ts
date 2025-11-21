@@ -1,6 +1,4 @@
-/* src/inngest/langchain-function.ts
-   Updated for E2B v2.x code-interpreter
-*/
+/* src/inngest/langchain-function.ts - FIXED VERSION */
 
 import { inngest } from "./client";
 import { ChatOpenAI } from "@langchain/openai";
@@ -12,25 +10,21 @@ import { Sandbox } from "@e2b/code-interpreter";
 
 const SANDBOX_TEMPLATE_ID = "r1xgkdrh3m2a4p8uieu7";
 
-/** Get sandbox hostname/domain */
 function getSandboxHostname(sandbox: Sandbox): string {
   const s = sandbox as any;
   
-  // Directly construct from sandboxId and sandboxDomain (most reliable for E2B v2.x)
   if (s.sandboxId && s.sandboxDomain) {
     const domain = `${s.sandboxId}.${s.sandboxDomain}`;
-    console.log("[getSandboxHostname] Constructed domain:", domain, "from sandboxId:", s.sandboxId, "and sandboxDomain:", s.sandboxDomain);
+    console.log("[getSandboxHostname] Constructed domain:", domain);
     return domain;
   }
   
-  // Fallback: just sandboxId with default E2B domain
   if (s.sandboxId) {
     const domain = `${s.sandboxId}.e2b.dev`;
     console.log("[getSandboxHostname] Fallback domain:", domain);
     return domain;
   }
   
-  // Other legacy methods
   if (typeof s.getHostname === "function") {
     const host = s.getHostname();
     if (host) return host;
@@ -42,14 +36,24 @@ function getSandboxHostname(sandbox: Sandbox): string {
   throw new Error("Unable to resolve sandbox hostname");
 }
 
-/** Build URL optionally including a port (E2B format: https://PORT-sandboxId.domain) */
 function buildSandboxUrl(hostname: string, port?: number) {
   const stripped = String(hostname).replace(/^https?:\/\//, "");
   if (port) {
-    // E2B format: https://3000-sandboxId.e2b.app
     return `https://3000-${stripped}`;
   }
   return `https://3000-${stripped}`;
+}
+
+// ✅ NEW: Helper function to ensure directories exist
+async function ensureDirectoryExists(sandbox: Sandbox, dirPath: string) {
+  try {
+    // Use mkdir -p with proper escaping
+    await sandbox.commands.run(`mkdir -p "${dirPath}"`);
+    console.log("[ensureDirectoryExists] Created/verified directory:", dirPath);
+  } catch (err: any) {
+    console.warn("[ensureDirectoryExists] Warning creating", dirPath, ":", err?.message);
+    // Don't throw - continue anyway
+  }
 }
 
 export const codeAgentFunction = inngest.createFunction(
@@ -82,7 +86,6 @@ export const codeAgentFunction = inngest.createFunction(
 
       /* ========== TOOLS ========== */
 
-      // Terminal tool -> uses sandbox.commands.run
       const terminalTool = new DynamicStructuredTool({
         name: "terminal",
         description: "Run shell commands in the sandbox. Use this to install packages with npm install.",
@@ -101,7 +104,7 @@ export const codeAgentFunction = inngest.createFunction(
         },
       });
 
-      // File write tool -> uses sandbox.files.write
+      // ✅ FIXED: Improved file writing with better directory handling
       const fileWriteTool = new DynamicStructuredTool({
         name: "createOrUpdateFiles",
         description: "Write files to the sandbox. Provide files array with path and content. Use relative paths like 'app/page.tsx'.",
@@ -115,9 +118,29 @@ export const codeAgentFunction = inngest.createFunction(
           const results: string[] = [];
 
           try {
+            // ✅ NEW: First pass - create all directories
+            const dirsToCreate = new Set<string>();
+            for (const f of files) {
+              const cleanPath = String(f.path || "")
+                .replace(/^\/+/, "")
+                .replace(/^home\/user\//, "");
+              
+              if (cleanPath.includes("/")) {
+                const dir = cleanPath.substring(0, cleanPath.lastIndexOf("/"));
+                if (dir) {
+                  dirsToCreate.add(`/home/user/${dir}`);
+                }
+              }
+            }
+
+            // ✅ Create all directories first
+            for (const dir of dirsToCreate) {
+              await ensureDirectoryExists(sandbox, dir);
+            }
+
+            // ✅ Second pass - write all files
             for (const f of files) {
               try {
-                // normalize path - remove leading slashes and /home/user prefix
                 const cleanPath = String(f.path || "")
                   .replace(/^\/+/, "")
                   .replace(/^home\/user\//, "");
@@ -128,18 +151,14 @@ export const codeAgentFunction = inngest.createFunction(
                 }
 
                 const fullPath = `/home/user/${cleanPath}`;
-
-                // ensure directory exists
+                
+                // ✅ FIXED: Ensure parent directory exists before writing
                 const dir = fullPath.substring(0, fullPath.lastIndexOf("/"));
                 if (dir && dir !== "/home/user") {
-                  try {
-                    await sandbox.commands.run(`mkdir -p "${dir}"`);
-                  } catch (mkdirErr) {
-                    console.warn("[createOrUpdateFiles] mkdir warning:", mkdirErr);
-                  }
+                  await ensureDirectoryExists(sandbox, dir);
                 }
 
-                // write file
+                // Write file
                 await sandbox.files.write(fullPath, String(f.content ?? ""));
                 results.push(`✅ ${cleanPath}`);
                 console.log(`[createOrUpdateFiles] wrote ${cleanPath}`);
@@ -157,35 +176,54 @@ export const codeAgentFunction = inngest.createFunction(
         },
       });
 
-      // File read tool -> uses sandbox.files.read
-      const readFilesTool = new DynamicStructuredTool({
-        name: "readFiles",
-        description: "Read files from the sandbox. Provide an array of file paths to read.",
-        schema: z.object({ paths: z.array(z.string()) }),
-        func: async ({ paths }: { paths: string[] }) => {
-          const out: Record<string, string> = {};
+   const readFilesTool = new DynamicStructuredTool({
+  name: "readFiles",
+  description: "Read files OR list directories from the sandbox.",
+  schema: z.object({ paths: z.array(z.string()) }),
+  func: async ({ paths }: { paths: string[] }) => {
+    const out: Record<string, string> = {};
 
+    try {
+      for (const p of paths) {
+        const fullPath = p.startsWith("/") ? p : `/home/user/${p}`;
+
+        try {
+          // 1) Try reading the file normally
           try {
-            for (const p of paths) {
-              try {
-                // Support both absolute and relative paths
-                const fullPath = p.startsWith("/") ? p : `/home/user/${p}`;
-                const content = await sandbox.files.read(fullPath);
-                const displayPath = fullPath.replace(/^\/home\/user\//, "");
-                out[displayPath] = String(content ?? "");
-              } catch (inner: any) {
-                console.warn("[readFiles] failed to read", p, ":", inner);
-                out[p] = `Error reading file: ${inner?.message ?? String(inner)}`;
-              }
-            }
-
-            return JSON.stringify(out, null, 2);
-          } catch (err: any) {
-            console.error("[readFiles] error:", err);
-            return `Error reading files: ${err?.message ?? String(err)}`;
+            const content = await sandbox.files.read(fullPath);
+            const displayPath = fullPath.replace(/^\/home\/user\//, "");
+            out[displayPath] = String(content ?? "");
+            continue;
+          } catch (fileErr) {
+            // ignore, may be directory → continue to next check
           }
-        },
-      });
+
+          // 2) Try checking if path is a directory
+          const lsResult = await sandbox.commands.run(`ls -1 "${fullPath}"`);
+          if (lsResult.stdout) {
+            const items = lsResult.stdout.trim().split("\n");
+            out[p] = JSON.stringify(
+              { type: "directory", items },
+              null,
+              2
+            );
+            continue;
+          }
+
+          // 3) If both fail → unknown path
+          out[p] = "Path not found.";
+        } catch (inner: any) {
+          out[p] = `Error handling path: ${inner?.message}`;
+        }
+      }
+
+      return JSON.stringify(out, null, 2);
+    } catch (err: any) {
+      return `Error reading files: ${err?.message ?? String(err)}`;
+    }
+  },
+});
+
 
       const modelWithTools = model.bindTools([terminalTool, fileWriteTool, readFilesTool]);
 
@@ -217,7 +255,6 @@ export const codeAgentFunction = inngest.createFunction(
       while (iterations < maxIterations) {
         const resp = await modelWithTools.invoke(messages);
 
-        // collect assistant content
         if (resp?.content) {
           const txt = typeof resp.content === "string" ? resp.content : JSON.stringify(resp.content);
           if (txt.trim()) {
@@ -261,7 +298,6 @@ export const codeAgentFunction = inngest.createFunction(
         iterations++;
       }
 
-      // ensure there is some assistant output
       if (!assistantTexts.length) {
         const summaryResp = await model.invoke([
           ...messages, 
@@ -279,7 +315,6 @@ export const codeAgentFunction = inngest.createFunction(
       const generatedFiles = await step.run("discover-files", async () => {
         const files: Record<string, string> = {};
 
-        // Helper for reading a path
         const tryRead = async (fullPath: string): Promise<string | null> => {
           try {
             return await sandbox.files.read(fullPath);
@@ -288,7 +323,6 @@ export const codeAgentFunction = inngest.createFunction(
           }
         };
 
-        // Try listing files in key directories
         try {
           const candidates = ["/home/user", "/home/user/app", "/home/user/public"];
           for (const dir of candidates) {
@@ -299,11 +333,9 @@ export const codeAgentFunction = inngest.createFunction(
                 const itemName: string = item.name ?? item.path ?? "";
                 if (!itemName) continue;
                 
-                // Skip directories
                 const isDir = item.isDir ?? item.isDirectory ?? false;
                 if (isDir) continue;
                 
-                // Only capture relevant file types
                 if (/\.(tsx?|jsx?|html|json|css|js)$/.test(itemName)) {
                   const rel = dir === "/home/user" 
                     ? itemName 
@@ -318,7 +350,6 @@ export const codeAgentFunction = inngest.createFunction(
             }
           }
         } catch {
-          // If list fails, attempt to read well-known paths
           const known = ["app/page.tsx", "app/layout.tsx", "package.json", "index.html"];
           for (const k of known) {
             try {
@@ -326,7 +357,7 @@ export const codeAgentFunction = inngest.createFunction(
               const c = await tryRead(full);
               if (c) files[k] = String(c);
             } catch {
-              // ignore
+              //
             }
           }
         }
@@ -335,7 +366,6 @@ export const codeAgentFunction = inngest.createFunction(
         return files;
       });
 
-      /* ========== Try to start Next.js dev server ========== */
       console.log("[Server] All discovered files:", Object.keys(generatedFiles));
       console.log("[Server] Checking for Next.js app files...");
       console.log("[Server] - Looking for 'app/page.tsx':", !!generatedFiles["app/page.tsx"]);
@@ -354,10 +384,8 @@ export const codeAgentFunction = inngest.createFunction(
         await step.run("start-next-server", async () => {
           try {
             console.log("[Server] Starting Next.js dev server on port 3000");
-            // Start server in background using shell command
             await sandbox.commands.run("cd /home/user && nohup npm run dev -- --port 3000 > /tmp/next.log 2>&1 &");
 
-            // poll for readiness
             const testUrl = buildSandboxUrl(hostname, 3000);
             let ready = false;
             for (let i = 0; i < 40; i++) {
@@ -372,7 +400,7 @@ export const codeAgentFunction = inngest.createFunction(
                   break;
                 }
               } catch {
-                // not ready yet
+                //
               }
               await new Promise((r) => setTimeout(r, 2000));
             }
