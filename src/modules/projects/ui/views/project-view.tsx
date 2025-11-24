@@ -4,7 +4,7 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/componen
 import { useTRPC } from "@/trpc/client";
 import { useSuspenseQuery } from "@tanstack/react-query";
 import { MessagesContainer } from "../components/messages-container";
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { Fragment } from "@/generated/prisma";
 import { ProjectHeader } from "../components/project-header";
 import { FragmentWeb } from "../components/fragment-web";
@@ -30,6 +30,12 @@ export const ProjectView = ({ projectId }: Props) => {
 
     const [activeFragment, setActiveFragment] = useState<Fragment | null>(null)
     const [tabState, setTabState] = useState<"preview" | "code">("preview")
+
+    // Reset state when switching projects to avoid stale fragment/preview
+    useEffect(() => {
+        setActiveFragment(null)
+        setTabState("preview")
+    }, [projectId])
 
     return (
         <div className="h-screen">
@@ -74,7 +80,7 @@ export const ProjectView = ({ projectId }: Props) => {
                             </div>
                         </div>
                         <TabsContent value="preview">
-                            {!!activeFragment && <FragmentWeb data={activeFragment} />}
+                            {!!activeFragment && <FragmentWeb key={activeFragment.id} data={activeFragment} />}
                         </TabsContent>
                         <TabsContent value="code" className="min-h-0">
                             {!!activeFragment?.files && (

@@ -5,7 +5,7 @@ import { Hint } from "@/components/hint";
 import { Button } from "@/components/ui/button";
 import { Fragment } from "@/generated/prisma";
 import { ExternalLinkIcon, RefreshCcwIcon, AlertCircleIcon } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTRPC } from "@/trpc/client";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -21,6 +21,13 @@ export function FragmentWeb({ data }: Props) {
   const [copied, setCopied] = useState(false);
   const [currentUrl, setCurrentUrl] = useState(data.sandboxUrl);
   const [showReconnectAlert, setShowReconnectAlert] = useState(false);
+
+  // Sync preview state when switching to a different fragment/project
+  useEffect(() => {
+    setCurrentUrl(data.sandboxUrl);
+    setFragmentKey((prev) => prev + 1);
+    setShowReconnectAlert(false);
+  }, [data.id, data.sandboxUrl]);
 
   const reconnectMutation = useMutation(
     trpc.fragments.getOrRecreateSandbox.mutationOptions({

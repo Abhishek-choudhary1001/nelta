@@ -16,6 +16,10 @@ export const MessagesContainer = ({ projectId,activeFragment, setActiveFragment 
   const trpc = useTRPC();
   const bottomRef=useRef<HTMLDivElement>(null)
   const lastAssistantMessageIdRef=useRef<string | null>(null)
+  useEffect(() => {
+    lastAssistantMessageIdRef.current = null
+    setActiveFragment(null)
+  }, [projectId, setActiveFragment])
   const { data: messages } = useSuspenseQuery(
     trpc.messages.getmany.queryOptions({
       projectId: projectId,
